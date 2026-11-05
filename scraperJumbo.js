@@ -35,7 +35,7 @@ async function explorarJumbo() {
         }
 
         const browser = await puppeteer.launch({ 
-            headless: false, 
+            headless: true, 
             defaultViewport: null, 
             args: ['--start-maximized'] 
         }); 

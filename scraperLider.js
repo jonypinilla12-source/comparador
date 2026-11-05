@@ -98,7 +98,10 @@ async function explorarLider() {
         }
 
         console.log('2. Iniciando navegador Puppeteer...');
-        const browser = await puppeteer.launch({ headless: false, defaultViewport: null, args: ['--start-maximized'] }); 
+        const browser = await puppeteer.launch({ 
+            headless: true, 
+            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+        });
         const page = await browser.newPage();
 
         // Contadores Globales para el reporte final

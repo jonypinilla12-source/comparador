@@ -140,7 +140,7 @@ async function explorarUnimarc() {
 
         console.log('2. Iniciando navegador Stealth Puppeteer para Unimarc...');
         const browser = await puppeteer.launch({ 
-            headless: false, 
+            headless: true, 
             defaultViewport: null, 
             args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox'] 
         }); 

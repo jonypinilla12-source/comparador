@@ -6,12 +6,12 @@ const pool = require('./db');
 
 const categoriasSantaIsabel = [
     'https://www.santaisabel.cl/despensa',
-    /*'https://www.santaisabel.cl/lacteos-huevos-y-congelados',
+    'https://www.santaisabel.cl/lacteos-huevos-y-congelados',
     'https://www.santaisabel.cl/botilleria',
     'https://www.santaisabel.cl/carnes-y-pescados',
     'https://www.santaisabel.cl/chocolates-galletas-y-snacks',
     'https://www.santaisabel.cl/limpieza',
-    'https://www.santaisabel.cl/frutas-y-verduras'*/
+    'https://www.santaisabel.cl/frutas-y-verduras'
 ];
 
 async function explorarSantaIsabel() {
@@ -27,7 +27,7 @@ async function explorarSantaIsabel() {
             supermercadoId = nuevoSuper.insertId;
         }
 
-        const browser = await puppeteer.launch({ headless: false, defaultViewport: null, args: ['--start-maximized'] }); 
+        const browser = await puppeteer.launch({ headless: true, defaultViewport: null, args: ['--start-maximized'] }); 
         const page = await browser.newPage();
 
         // Contadores Globales
