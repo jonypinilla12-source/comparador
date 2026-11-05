@@ -6,7 +6,7 @@ const pool = require('./db');
 
 // LINKS DE JUMBO (Puedes agregar más)
 const categoriasJumbo = [
-    /*'https://www.jumbo.cl/frutas-y-verduras',
+    'https://www.jumbo.cl/frutas-y-verduras',
     'https://www.jumbo.cl/lacteos-huevos-y-congelados',
     'https://www.jumbo.cl/quesos-y-fiambres',
     'https://www.jumbo.cl/carnes-y-pescados',
@@ -14,7 +14,7 @@ const categoriasJumbo = [
     'https://www.jumbo.cl/licores-bebidas-y-aguas',
     'https://www.jumbo.cl/chocolates-galletas-y-snacks',
     'https://www.jumbo.cl/limpieza',
-    'https://www.jumbo.cl/belleza-y-cuidado-personal',*/
+    'https://www.jumbo.cl/belleza-y-cuidado-personal',
     'https://www.jumbo.cl/mascotas',
 ];
 

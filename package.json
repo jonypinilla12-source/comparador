@@ -20,8 +20,8 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.5.0",
     "mysql2": "^3.24.6",
-    "puppeteer": "^25.16.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer": "^21.11.0",
+    "puppeteer-extra": "4.3.1",
+    "puppeteer-extra-plugin-stealth": "^2.4.9"
   }
 }
