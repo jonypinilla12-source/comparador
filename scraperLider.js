@@ -99,8 +99,14 @@ async function explorarLider() {
 
         console.log('2. Iniciando navegador Puppeteer...');
         const browser = await puppeteer.launch({ 
-            headless: true, 
-            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: null,
+            args: [
+                '--start-maximized',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage'
+            ]
         });
         const page = await browser.newPage();
 

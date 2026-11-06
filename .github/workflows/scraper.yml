@@ -10,6 +10,13 @@ jobs:
   ejecutar-scrapers:
     runs-on: ubuntu-latest
 
+    env:
+      CI: true
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+
     steps:
       - name: Clonar repositorio
         uses: actions/checkout@v4
@@ -19,37 +26,25 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Instalar dependencias
-        run: npm install
+      - name: Instalar dependencias limpias y navegador Chrome
+        run: |
+          rm -rf node_modules
+          npm install
+          npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
+          npx puppeteer browsers install chrome
 
       - name: Ejecutar Scraper Lider
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
+        continue-on-error: true
         run: node scraperLider.js
 
       - name: Ejecutar Scraper Jumbo
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
+        continue-on-error: true
         run: node scraperJumbo.js
 
       - name: Ejecutar Scraper Santa Isabel
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
-        run: node scraperSantalsabel.js
+        continue-on-error: true
+        run: node scraperSantaIsabel.js
 
       - name: Ejecutar Scraper Unimarc
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
+        continue-on-error: true
         run: node scraperUnimarc.js

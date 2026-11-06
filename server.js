@@ -62,11 +62,42 @@ function calcularDistancia(lat1, lon1, lat2, lon2) {
     const R = 6371; // Radio de la Tierra en km
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
               Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c; 
+}
+
+// Busca la sucursal de la tabla `sucursales` para un supermercado_id
+function obtenerSucursalDeMarca(sucursales, supermercadoId, userLat, userLon) {
+    const sucursalesDeMarca = sucursales.filter(s => Number(s.supermercado_id) === Number(supermercadoId));
+    if (sucursalesDeMarca.length === 0) return null;
+
+    let sucursalSeleccionada = sucursalesDeMarca[0];
+    let minDistance = Infinity;
+    let distanciaStr = null;
+
+    if (!isNaN(userLat) && !isNaN(userLon)) {
+        sucursalesDeMarca.forEach(suc => {
+            const d = calcularDistancia(userLat, userLon, Number(suc.latitud), Number(suc.longitud));
+            if (d < minDistance) {
+                minDistance = d;
+                sucursalSeleccionada = suc;
+                distanciaStr = (d < 1) ? `${Math.round(d * 1000)} m` : `${d.toFixed(1)} km`;
+            }
+        });
+    }
+
+    return {
+        sucursal_id: sucursalSeleccionada.id,
+        nombre_local: sucursalSeleccionada.nombre_local,
+        direccion: sucursalSeleccionada.direccion,
+        latitud: Number(sucursalSeleccionada.latitud),
+        longitud: Number(sucursalSeleccionada.longitud),
+        distancia_km: minDistance !== Infinity ? minDistance : null,
+        distancia_str: distanciaStr
+    };
 }
 
 // Obtener o crear lista por defecto si Flutter aún no envía lista_id
@@ -185,96 +216,70 @@ app.post('/api/listas', verificarToken, async (req, res) => {
 // PRODUCTOS Y RECETAS
 // ==========================================
 app.get('/api/productos', async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 50;
-        const offset = (page - 1) * limit;
-        const categoria = req.query.categoria || 'Todos';
-        const busqueda = req.query.busqueda || '';
-        
-        // RECIBIMOS LA UBICACIÓN DESDE FLUTTER
-        const lat = parseFloat(req.query.lat);
-        const lon = parseFloat(req.query.lon);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+    const busqueda = req.query.busqueda || '';
+    const categoria = req.query.categoria || '';
+    const userLat = parseFloat(req.query.lat);
+    const userLon = parseFloat(req.query.lon);
 
-        let filtroSql = "";
-        let queryParamsCount = [];
-        let queryParamsIds = [];
+    try {
+        let whereClause = "WHERE 1=1";
+        let paramsCount = [];
 
         if (busqueda) {
-            const busquedaLimpia = busqueda.trim();
-            if (/^\d+$/.test(busquedaLimpia)) {
-                filtroSql = " AND p.codigo_barras = ?";
-                queryParamsCount = [busquedaLimpia];
-                queryParamsIds = [busquedaLimpia, limit, offset];
-            } else {
-                const palabras = busquedaLimpia.toLowerCase().split(' ').filter(p => p.length > 0);
-                let condiciones = [];
-                palabras.forEach(palabra => {
-                    let termino = palabra;
-                    if (termino.endsWith('s') && termino.length > 3) termino = termino.slice(0, -1);
-                    condiciones.push("(LOWER(p.nombre) LIKE ? OR LOWER(p.marca) LIKE ?)");
-                    queryParamsCount.push(`%${termino}%`, `%${termino}%`);
-                    queryParamsIds.push(`%${termino}%`, `%${termino}%`);
-                });
-                filtroSql = " AND (" + condiciones.join(" AND ") + ")";
-                queryParamsIds.push(limit, offset);
-            }
-        } else if (categoria !== 'Todos') {
-            filtroSql = " AND p.categoria = ?";
-            queryParamsCount = [categoria];
-            queryParamsIds = [categoria, limit, offset];
-        } else {
-            queryParamsIds = [limit, offset];
+            whereClause += " AND (p.nombre LIKE ? OR p.marca LIKE ? OR p.codigo_barras LIKE ?)";
+            const term = `%${busqueda}%`;
+            paramsCount.push(term, term, term);
         }
 
-        const queryCount = `SELECT COUNT(DISTINCT pp.producto_id) as total FROM precios_productos pp JOIN productos p ON p.id = pp.producto_id WHERE 1=1 ${filtroSql}`;
-        const [countResult] = await pool.query(queryCount, queryParamsCount);
-        const totalProductos = countResult[0].total;
-        const totalPages = Math.ceil(totalProductos / limit);
+        if (categoria && categoria.toLowerCase() !== 'todos') {
+            whereClause += " AND p.categoria = ?";
+            paramsCount.push(categoria);
+        }
 
-        if (totalProductos === 0) return res.json({ data: [], currentPage: page, totalPages: 0 });
+        const countQuery = `SELECT COUNT(DISTINCT p.id) as total FROM productos p ${whereClause}`;
+        const [countResult] = await pool.query(countQuery, paramsCount);
+        const totalItems = countResult[0].total;
+        const totalPages = Math.ceil(totalItems / limit);
 
-        const queryIds = `SELECT p.id, COUNT(DISTINCT pp.supermercado_id) as cant_supermercados FROM productos p JOIN precios_productos pp ON p.id = pp.producto_id WHERE 1=1 ${filtroSql} GROUP BY p.id ORDER BY cant_supermercados DESC, p.id DESC LIMIT ? OFFSET ?`;
-        const [productosIds] = await pool.query(queryIds, queryParamsIds);
+        if (totalItems === 0) {
+            return res.json({ data: [], currentPage: page, totalPages: 0 });
+        }
 
-        if (productosIds.length === 0) return res.json({ data: [], currentPage: page, totalPages: totalPages });
-        const ids = productosIds.map(p => p.id);
+        const idsQuery = `SELECT DISTINCT p.id FROM productos p ${whereClause} LIMIT ? OFFSET ?`;
+        const [idsRows] = await pool.query(idsQuery, [...paramsCount, limit, offset]);
+        const ids = idsRows.map(r => r.id);
+
+        if (ids.length === 0) {
+            return res.json({ data: [], currentPage: page, totalPages: 0 });
+        }
 
         const queryData = `
-            SELECT p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
-                   s.id as supermercado_id, s.nombre as supermarket, s.url_logo, pp.precio as price, pp.url_producto 
+            SELECT 
+                p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
+                s.id as supermercado_id, s.nombre as supermarket, s.url_logo, 
+                pp.precio as price, pp.url_producto 
             FROM productos p 
             JOIN precios_productos pp ON p.id = pp.producto_id 
             JOIN supermercados s ON pp.supermercado_id = s.id 
-            WHERE p.id IN (?)`;
+            WHERE p.id IN (?)
+        `;
         const [rows] = await pool.query(queryData, [ids]);
-        
-        // CALCULAMOS LAS SUCURSALES CERCANAS
-        let sucursalesInfo = {};
-        if (!isNaN(lat) && !isNaN(lon)) {
-            const [sucursales] = await pool.query("SELECT * FROM sucursales");
-            sucursales.forEach(suc => {
-                const dist = calcularDistancia(lat, lon, suc.latitud, suc.longitud);
-                if (!sucursalesInfo[suc.supermercado_id] || dist < sucursalesInfo[suc.supermercado_id].distancia) {
-                    sucursalesInfo[suc.supermercado_id] = {
-                        nombre_local: suc.nombre_local,
-                        distancia: dist,
-                        distancia_str: dist < 1 ? `${(dist * 1000).toFixed(0)} m` : `${dist.toFixed(1)} km`,
-                        latitud: suc.latitud,
-                        longitud: suc.longitud
-                    };
-                }
-            });
-        }
-        
+
+        // Cargar todas las sucursales de la base de datos (siempre)
+        const [sucursales] = await pool.query("SELECT * FROM sucursales WHERE latitud IS NOT NULL AND longitud IS NOT NULL");
+
         const obtenerColores = (nombreSuper) => {
             const lower = nombreSuper.toLowerCase();
-            if (lower.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' }; 
-            if (lower.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' }; 
+            if (lower.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' };
+            if (lower.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' };
             return { bgColor: '#DCFCE7', textColor: '#15803D' };
         };
 
         const productosMap = {};
+        
         rows.forEach(row => {
             if (!productosMap[row.id]) {
                 let nutricionObj = null;
@@ -283,48 +288,46 @@ app.get('/api/productos', async (req, res) => {
                 }
                 productosMap[row.id] = { id: row.id, name: row.name, brand: row.brand, url_imagen: row.url_imagen, nutrition: nutricionObj, all_prices: [] };
             }
+
+            // Obtener sucursal real desde la tabla `sucursales` (con o sin userLat/userLon)
+            const sucInfo = obtenerSucursalDeMarca(sucursales, row.supermercado_id, userLat, userLon);
+
             productosMap[row.id].all_prices.push({ 
-                supermercado_id: row.supermercado_id, // Añadido para el cruce
+                supermercado_id: row.supermercado_id,
                 supermarket: row.supermarket, 
                 price: row.price, 
                 url_producto: row.url_producto, 
-                url_logo: row.url_logo 
+                url_logo: row.url_logo,
+                nombre_local: sucInfo ? sucInfo.nombre_local : null,
+                direccion: sucInfo ? sucInfo.direccion : null,
+                latitud: sucInfo ? sucInfo.latitud : null,
+                longitud: sucInfo ? sucInfo.longitud : null,
+                distancia_str: sucInfo ? sucInfo.distancia_str : null,
+                distancia_km: sucInfo ? sucInfo.distancia_km : null
             });
         });
 
         const productosArray = ids.map(id => productosMap[id]).filter(Boolean);
+        
         const productosFormateados = productosArray.map(prod => {
             prod.all_prices.sort((a, b) => a.price - b.price);
             const cheapest = prod.all_prices[0];
             const col = obtenerColores(cheapest.supermarket);
+            
             return {
                 id: prod.id, name: prod.name, brand: prod.brand, image_url: prod.url_imagen, nutrition: prod.nutrition,
-                supermarket: cheapest.supermarket, price: '$' + cheapest.price.toLocaleString('es-CL'),
-                url_logo: cheapest.url_logo,
-                bgColor: col.bgColor, textColor: col.textColor,
+                supermarket: cheapest.supermarket, price: '$ ' + cheapest.price.toLocaleString('es-CL'),
+                url_logo: cheapest.url_logo, bgColor: col.bgColor, textColor: col.textColor,
                 all_prices: prod.all_prices.map(p => {
                     const c = obtenerColores(p.supermarket);
-                    const suc = sucursalesInfo[p.supermercado_id]; // Obtenemos la sucursal
-                    return { 
-                        supermarket: p.supermarket, 
-                        price: p.price, // Mantenemos el int para los cálculos
-                        priceStr: '$' + p.price.toLocaleString('es-CL'), 
-                        url_producto: p.url_producto, 
-                        url_logo: p.url_logo, 
-                        bgColor: c.bgColor, 
-                        textColor: c.textColor,
-                        // Añadimos los datos de la sucursal al producto
-                        nombre_local: suc ? suc.nombre_local : null,
-                        distancia_str: suc ? suc.distancia_str : null,
-                        latitud: suc ? suc.latitud : null,
-                        longitud: suc ? suc.longitud : null,
-                    };
+                    return { ...p, priceStr: '$ ' + p.price.toLocaleString('es-CL'), bgColor: c.bgColor, textColor: c.textColor };
                 })
             };
         });
 
         res.json({ data: productosFormateados, currentPage: page, totalPages: totalPages });
     } catch (error) {
+        console.error("Error productos:", error);
         res.status(500).json({ error: 'Error al obtener productos' });
     }
 });
@@ -357,122 +360,157 @@ app.get('/api/recetas', async (req, res) => {
 // CARRITO MULTI-LISTAS Y SUCURSALES
 // ==========================================
 app.get('/api/mi-lista', verificarToken, async (req, res) => {
-    const usuario_id = req.user.id;
-    let lista_id = req.query.lista_id;
-    const lat = parseFloat(req.query.lat);
-    const lon = parseFloat(req.query.lon);
+    const listaId = req.query.lista_id;
+    const userLat = parseFloat(req.query.lat);
+    const userLon = parseFloat(req.query.lon);
 
     try {
-        if (!lista_id) lista_id = await obtenerListaPorDefecto(usuario_id);
+        const queryListas = "SELECT id, producto_id, cantidad FROM favoritos WHERE lista_id = ?";
+        const [listaRows] = await pool.query(queryListas, [listaId]);
 
-        const queryLista = `
-            SELECT f.id as favorito_id, f.cantidad, p.id as producto_id, p.nombre, p.marca, p.url_imagen 
-            FROM favoritos f
-            JOIN productos p ON f.producto_id = p.id
-            WHERE f.usuario_id = ? AND f.lista_id = ?
-        `;
-        const [productosLista] = await pool.query(queryLista, [usuario_id, lista_id]);
-        if (productosLista.length === 0) return res.json({ productos: [], resumen: null });
-
-        const idsProductos = productosLista.map(p => p.producto_id);
-
-        const queryPrecios = `
-            SELECT pp.producto_id, pp.precio, s.id as supermercado_id, s.nombre as supermarket, s.url_logo, pp.url_producto
-            FROM precios_productos pp
-            JOIN supermercados s ON pp.supermercado_id = s.id
-            WHERE pp.producto_id IN (?)
-        `;
-        const [precios] = await pool.query(queryPrecios, [idsProductos]);
-
-        // Calcular sucursales cercanas si hay GPS
-        let sucursalesInfo = {};
-        if (!isNaN(lat) && !isNaN(lon)) {
-            const [sucursales] = await pool.query("SELECT * FROM sucursales");
-            sucursales.forEach(suc => {
-                const dist = calcularDistancia(lat, lon, suc.latitud, suc.longitud);
-                if (!sucursalesInfo[suc.supermercado_id] || dist < sucursalesInfo[suc.supermercado_id].distancia) {
-                    sucursalesInfo[suc.supermercado_id] = {
-                        nombre_local: suc.nombre_local,
-                        distancia: dist,
-                        distancia_str: dist < 1 ? `${(dist * 1000).toFixed(0)} m` : `${dist.toFixed(1)} km`,
-                        latitud: suc.latitud,
-                        longitud: suc.longitud
-                    };
-                }
-            });
+        if (listaRows.length === 0) {
+            return res.json({ productos: [], resumen: { opciones: [] } });
         }
 
-        let totalesSupermercados = {};
-        precios.forEach(p => {
-            if (!totalesSupermercados[p.supermarket]) {
-                totalesSupermercados[p.supermarket] = { id: p.supermercado_id, total: 0, items_encontrados: [], items_faltantes: [], url_logo: p.url_logo };
-            }
-        });
+        const productIds = listaRows.map(row => row.producto_id);
+        const cantidadesMap = {};
+        listaRows.forEach(row => { cantidadesMap[row.producto_id] = row.cantidad; });
 
-        let totalCombinado = 0;
-        const obtenerColores = (nombre) => {
-            const l = nombre.toLowerCase();
-            if (l.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' };
-            if (l.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' };
+        const queryData = `
+            SELECT 
+                p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
+                s.id as supermercado_id, s.nombre as supermarket, s.url_logo, 
+                pp.precio as price, pp.url_producto 
+            FROM productos p 
+            JOIN precios_productos pp ON p.id = pp.producto_id 
+            JOIN supermercados s ON pp.supermercado_id = s.id 
+            WHERE p.id IN (?)
+        `;
+        const [rows] = await pool.query(queryData, [productIds]);
+        const [sucursales] = await pool.query("SELECT * FROM sucursales WHERE latitud IS NOT NULL AND longitud IS NOT NULL");
+
+        const obtenerColores = (nombreSuper) => {
+            const lower = nombreSuper.toLowerCase();
+            if (lower.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' };
+            if (lower.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' };
             return { bgColor: '#DCFCE7', textColor: '#15803D' };
         };
 
-        const productosFinales = productosLista.map(prod => {
-            const preciosDelProducto = precios.filter(p => p.producto_id === prod.producto_id);
-            for (let superm in totalesSupermercados) {
-                const precioEnSuper = preciosDelProducto.find(p => p.supermarket === superm);
-                if (precioEnSuper) {
-                    totalesSupermercados[superm].total += (precioEnSuper.precio * prod.cantidad);
-                    totalesSupermercados[superm].items_encontrados.push(prod.producto_id);
-                } else {
-                    totalesSupermercados[superm].items_faltantes.push({ nombre: prod.nombre, marca: prod.marca || 'Sin marca', imagen: prod.url_imagen });
+        const productosMap = {};
+        const resumenCostos = { combinada: 0, tiendas: {} };
+
+        rows.forEach(row => {
+            const prodId = row.id;
+            const cantidad = cantidadesMap[prodId] || 1;
+
+            if (!productosMap[prodId]) {
+                let nutricionObj = null;
+                if (row.info_nutricional) {
+                    try { nutricionObj = typeof row.info_nutricional === 'string' ? JSON.parse(row.info_nutricional) : row.info_nutricional; } catch (e) {}
+                }
+                productosMap[prodId] = { producto_id: prodId, nombre: row.name, marca: row.brand, image_url: row.url_imagen, url_imagen: row.url_imagen, cantidad, all_prices: [] };
+            }
+
+            // Obtener sucursal real de la tabla `sucursales` (siempre)
+            const sucInfo = obtenerSucursalDeMarca(sucursales, row.supermercado_id, userLat, userLon);
+
+            productosMap[prodId].all_prices.push({ 
+                supermarket: row.supermarket, 
+                supermercado_id: row.supermercado_id,
+                price: row.price, 
+                url_producto: row.url_producto, 
+                url_logo: row.url_logo,
+                nombre_local: sucInfo ? sucInfo.nombre_local : null,
+                direccion: sucInfo ? sucInfo.direccion : null,
+                latitud: sucInfo ? sucInfo.latitud : null,
+                longitud: sucInfo ? sucInfo.longitud : null,
+                distancia_str: sucInfo ? sucInfo.distancia_str : null,
+                distancia_km: sucInfo ? sucInfo.distancia_km : null
+            });
+        });
+
+        const productosFinal = [];
+        
+        Object.values(productosMap).forEach(prod => {
+            prod.all_prices.sort((a, b) => a.price - b.price);
+            const cheapest = prod.all_prices[0];
+            resumenCostos.combinada += (cheapest.price * prod.cantidad);
+
+            prod.all_prices.forEach(p => {
+                const c = obtenerColores(p.supermarket);
+                p.priceStr = '$ ' + p.price.toLocaleString('es-CL');
+                p.bgColor = c.bgColor;
+                p.textColor = c.textColor;
+
+                if (!resumenCostos.tiendas[p.supermarket]) {
+                    resumenCostos.tiendas[p.supermarket] = { 
+                        supermercado_id: p.supermercado_id,
+                        nombre: p.supermarket, 
+                        total: 0, 
+                        faltantes: [], 
+                        url_logo: p.url_logo,
+                        sucursal_cercana: p.latitud != null ? {
+                            nombre_local: p.nombre_local,
+                            direccion: p.direccion,
+                            latitud: p.latitud,
+                            longitud: p.longitud,
+                            distancia_str: p.distancia_str,
+                            distancia_km: p.distancia_km
+                        } : null
+                    };
+                }
+                resumenCostos.tiendas[p.supermarket].total += (p.price * prod.cantidad);
+            });
+
+            const tiendasDelProducto = prod.all_prices.map(p => p.supermarket);
+            Object.keys(resumenCostos.tiendas).forEach(t => {
+                if (!tiendasDelProducto.includes(t)) {
+                    resumenCostos.tiendas[t].faltantes.push({ id: prod.producto_id, nombre: prod.nombre });
+                }
+            });
+
+            productosFinal.push(prod);
+        });
+
+        const opciones = [
+            { nombre: 'COMBINADO', total: resumenCostos.combinada, total_str: '$ ' + resumenCostos.combinada.toLocaleString('es-CL'), faltantes: [], url_logo: null }
+        ];
+
+        let mejorTiendaUnica = null;
+        let mejorCostoUnico = Infinity;
+
+        Object.values(resumenCostos.tiendas).forEach(t => {
+            t.total_str = '$ ' + t.total.toLocaleString('es-CL');
+            opciones.push(t);
+            if (t.faltantes.length === 0 && t.total < mejorCostoUnico) {
+                mejorCostoUnico = t.total;
+                mejorTiendaUnica = t.nombre;
+            }
+        });
+
+        opciones.sort((a, b) => a.total - b.total);
+        let ahorroEst = 0;
+        if (opciones.length > 1) {
+            const tiendasCompletas = opciones.filter(o => o.faltantes.length === 0 && o.nombre !== 'COMBINADO');
+            if (tiendasCompletas.length > 0) {
+                const masCara = Math.max(...tiendasCompletas.map(o => o.total));
+                if (masCara > opciones[0].total) {
+                    ahorroEst = masCara - opciones[0].total;
                 }
             }
-            preciosDelProducto.sort((a, b) => a.precio - b.precio);
-            if (preciosDelProducto.length > 0) totalCombinado += (preciosDelProducto[0].precio * prod.cantidad);
-
-            return {
-                favorito_id: prod.favorito_id, producto_id: prod.producto_id, nombre: prod.nombre, 
-                marca: prod.marca, cantidad: prod.cantidad, image_url: prod.url_imagen,
-                all_prices: preciosDelProducto.map(p => {
-                    const col = obtenerColores(p.supermarket);
-                    return { supermarket: p.supermarket, price: p.precio, priceStr: '$' + p.precio.toLocaleString('es-CL'), url_producto: p.url_producto, url_logo: p.url_logo, bgColor: col.bgColor, textColor: col.textColor };
-                })
-            };
-        });
-
-        let opciones = [{ nombre: 'Combinado (Varias Tiendas)', total: totalCombinado, total_str: '$' + totalCombinado.toLocaleString('es-CL'), bgColor: '#F3F4F6', textColor: '#1F2937', faltantes: [], estaCompleto: true }];
-
-        for (const [nombre, data] of Object.entries(totalesSupermercados)) {
-            if (data.items_encontrados.length > 0) {
-                const col = obtenerColores(nombre);
-                opciones.push({
-                    nombre: nombre, total: data.total, total_str: '$' + data.total.toLocaleString('es-CL'),
-                    bgColor: col.bgColor, textColor: col.textColor,
-                    faltantes: data.items_faltantes, estaCompleto: data.items_faltantes.length === 0,
-                    sucursal_cercana: sucursalesInfo[data.id] || null,
-                    url_logo: data.url_logo
-                });
-            }
         }
 
-        opciones.sort((a, b) => {
-            if (a.estaCompleto && !b.estaCompleto) return -1;
-            if (!a.estaCompleto && b.estaCompleto) return 1;
-            if (!a.estaCompleto && !b.estaCompleto) return a.faltantes.length - b.faltantes.length;
-            return a.total - b.total;
-        });
+        const resumenFinal = {
+            mejor_supermercado: mejorTiendaUnica || 'COMBINADO',
+            ahorro_estimado: ahorroEst > 0 ? '$ ' + ahorroEst.toLocaleString('es-CL') : null,
+            ahorro_total: ahorroEst,
+            opciones
+        };
 
-        let ahorroTotal = 0;
-        const opcionesCompletas = opciones.filter(o => o.estaCompleto);
-        if (opcionesCompletas.length > 1) {
-            ahorroTotal = opcionesCompletas[opcionesCompletas.length - 1].total - opcionesCompletas[0].total;
-        }
-
-        res.json({ productos: productosFinales, resumen: { opciones, ahorro_total: ahorroTotal, ahorro_total_str: '$' + ahorroTotal.toLocaleString('es-CL') } });
+        res.json({ productos: productosFinal, resumen: resumenFinal });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Error al obtener la lista de compras' });
+        console.error("Error al obtener lista:", error);
+        res.status(500).json({ error: 'Error interno del servidor' });
     }
 });
 
@@ -516,6 +554,68 @@ app.delete('/api/mi-lista/eliminar/:producto_id', verificarToken, async (req, re
         res.json({ mensaje: 'Producto eliminado' });
     } catch (error) {
         res.status(500).json({ error: 'Error al eliminar' });
+    }
+});
+
+// ==========================================
+// RUTA: OBTENER SUCURSALES CERCANAS (MAPA GENERAL)
+// ==========================================
+app.get('/api/sucursales', async (req, res) => {
+    const userLat = parseFloat(req.query.lat);
+    const userLon = parseFloat(req.query.lon);
+
+    try {
+        let queryData = `
+            SELECT 
+                suc.id as sucursal_id, 
+                suc.supermercado_id,
+                suc.nombre_local, 
+                suc.direccion, 
+                suc.latitud, 
+                suc.longitud,
+                sup.nombre as nombre_cadena,
+                sup.url_logo
+            FROM sucursales suc
+            JOIN supermercados sup ON suc.supermercado_id = sup.id
+            WHERE suc.latitud IS NOT NULL AND suc.longitud IS NOT NULL
+        `;
+
+        const [rows] = await pool.query(queryData);
+
+        const sucursalesProcesadas = rows.map(row => {
+            let distancia = null;
+            let distanciaStr = null;
+
+            if (!isNaN(userLat) && !isNaN(userLon) && row.latitud && row.longitud) {
+                distancia = calcularDistancia(userLat, userLon, Number(row.latitud), Number(row.longitud));
+                if (distancia < 1) {
+                    distanciaStr = `${Math.round(distancia * 1000)} m`;
+                } else {
+                    distanciaStr = `${distancia.toFixed(1)} km`;
+                }
+            }
+
+            return {
+                ...row,
+                latitud: Number(row.latitud),
+                longitud: Number(row.longitud),
+                distancia_km: distancia,
+                distancia_str: distanciaStr
+            };
+        });
+
+        if (!isNaN(userLat) && !isNaN(userLon)) {
+            sucursalesProcesadas.sort((a, b) => {
+                if (a.distancia_km === null) return 1;
+                if (b.distancia_km === null) return -1;
+                return a.distancia_km - b.distancia_km;
+            });
+        }
+
+        res.json(sucursalesProcesadas);
+    } catch (error) {
+        console.error("Error al obtener sucursales:", error);
+        res.status(500).json({ error: 'Error interno del servidor al consultar sucursales.' });
     }
 });
 

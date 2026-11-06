@@ -140,10 +140,15 @@ async function explorarUnimarc() {
 
         console.log('2. Iniciando navegador Stealth Puppeteer para Unimarc...');
         const browser = await puppeteer.launch({ 
-            headless: true, 
-            defaultViewport: null, 
-            args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox'] 
-        }); 
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: null,
+            args: [
+                '--start-maximized',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage'
+            ]
+        });
         const page = await browser.newPage();
 
         // Intercepta peticiones Fetch y XHR a nivel de navegador

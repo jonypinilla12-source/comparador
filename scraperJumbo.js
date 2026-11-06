@@ -35,10 +35,15 @@ async function explorarJumbo() {
         }
 
         const browser = await puppeteer.launch({ 
-            headless: true, 
-            defaultViewport: null, 
-            args: ['--start-maximized'] 
-        }); 
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: null,
+            args: [
+                '--start-maximized',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage'
+            ]
+        });
         const page = await browser.newPage();
 
         // Contadores Globales
