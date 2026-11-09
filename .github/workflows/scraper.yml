@@ -2,13 +2,14 @@ name: Automatizar Scrapers de Precios
 
 on:
   schedule:
-    # Se ejecuta todos los días a las 3:00 AM (Hora UTC)
-    - cron: '0 3 * * *'
+    # Se ejecuta Lunes (1) y Viernes (5) a las 6:00 AM UTC (3:00 AM Hora Chile)
+    - cron: '0 6 * * 1,5'
   workflow_dispatch: # Permite ejecutarlo manualmente desde la pestaña Actions en GitHub
 
 jobs:
   ejecutar-scrapers:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # Límite de seguridad de quase 6 horas
 
     env:
       CI: true
@@ -33,6 +34,10 @@ jobs:
           npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
           npx puppeteer browsers install chrome
 
+      - name: Sincronizar Sucursales Nacionales
+        continue-on-error: true
+        run: node importarSucursalesMasivoNacional.js
+
       - name: Ejecutar Scraper Lider
         continue-on-error: true
         run: node scraperLider.js
@@ -48,3 +53,7 @@ jobs:
       - name: Ejecutar Scraper Unimarc
         continue-on-error: true
         run: node scraperUnimarc.js
+
+      - name: Ejecutar Scraper Tottus
+        continue-on-error: true
+        run: node scraperTottus.js

@@ -260,7 +260,7 @@ app.get('/api/productos', async (req, res) => {
             SELECT 
                 p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
                 s.id as supermercado_id, s.nombre as supermarket, s.url_logo, 
-                pp.precio as price, pp.url_producto 
+                pp.precio as price, pp.precio_anterior, pp.url_producto, pp.escaneado_en 
             FROM productos p 
             JOIN precios_productos pp ON p.id = pp.producto_id 
             JOIN supermercados s ON pp.supermercado_id = s.id 
@@ -616,6 +616,308 @@ app.get('/api/sucursales', async (req, res) => {
     } catch (error) {
         console.error("Error al obtener sucursales:", error);
         res.status(500).json({ error: 'Error interno del servidor al consultar sucursales.' });
+    }
+});
+
+
+// ==========================================
+// RUTA: ESCÁNER INTELIGENTE + PRODUCTOS SIMILARES
+// ==========================================
+app.get('/api/escanear/:codigo', async (req, res) => {
+    const codigoRaw = (req.params.codigo || '').trim();
+    const codigoSinCeros = codigoRaw.replace(/^0+/, '');
+    const codigoConCero = codigoSinCeros.length === 12 ? '0' + codigoSinCeros : codigoSinCeros;
+    const userLat = parseFloat(req.query.lat);
+    const userLon = parseFloat(req.query.lon);
+
+    try {
+        // 1. Buscar el producto escaneado por código exacto, sin ceros o prefijo EAN
+        const [prodRows] = await pool.query(
+            `SELECT id, nombre, marca, categoria, codigo_barras 
+             FROM productos 
+             WHERE codigo_barras IN (?, ?, ?) 
+                OR codigo_barras LIKE ? 
+             LIMIT 1`,
+            [codigoRaw, codigoSinCeros, codigoConCero, `%${codigoSinCeros}%`]
+        );
+
+        if (prodRows.length === 0) {
+            return res.status(404).json({ encontrado: false, mensaje: 'Producto no encontrado en la base de datos' });
+        }
+
+        const prodBase = prodRows[0];
+
+        // 2. Buscar productos similares (ej. "Aceite Maravilla Chef" -> busca otros "Aceite Maravilla")
+        const stopWords = ['de', 'el', 'la', 'los', 'las', 'en', 'con', 'para', 'por', 'sin', 'un', 'una', 'bolsa', 'botella', 'caja', 'pack', 'envase', 'formato', 'display', 'doypack', 'tira', 'sachet', 'tarro', 'lata'];
+        const marcaPalabras = (prodBase.marca || '').toLowerCase().split(/\s+/).filter(Boolean);
+
+        const palabrasClave = (prodBase.nombre || '')
+            .toLowerCase()
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z\s]/g, ' ')
+            .split(/\s+/)
+            .filter(w => w.length >= 3 && !stopWords.includes(w) && !marcaPalabras.includes(w))
+            .slice(0, 2); // Tomamos las 2 palabras principales del producto (ej: ["aceite", "maravilla"])
+
+        let idsSimilares = [];
+        if (palabrasClave.length > 0) {
+            let whereSim = "WHERE p.id != ?";
+            let paramsSim = [prodBase.id];
+
+            // Exigimos la primera palabra clave (ej. "aceite") y priorizamos la segunda (ej. "maravilla")
+            whereSim += " AND p.nombre LIKE ?";
+            paramsSim.push(`%${palabrasClave[0]}%`);
+
+            let orderSim = "COUNT(DISTINCT pp.supermercado_id) DESC, MIN(pp.precio) ASC";
+            if (palabrasClave.length > 1) {
+                orderSim = `(CASE WHEN p.nombre LIKE '%${palabrasClave[1]}%' THEN 0 ELSE 1 END), ` + orderSim;
+            }
+
+            const [simRows] = await pool.query(
+                `SELECT p.id 
+                 FROM productos p
+                 JOIN precios_productos pp ON p.id = pp.producto_id
+                 ${whereSim}
+                 GROUP BY p.id
+                 ORDER BY ${orderSim}
+                 LIMIT 6`,
+                paramsSim
+            );
+            idsSimilares = simRows.map(r => r.id);
+        }
+
+        const todosLosIds = [prodBase.id, ...idsSimilares];
+
+        // 3. Obtener precios y sucursales para el producto escaneado y sus similares
+        const [rows] = await pool.query(`
+            SELECT 
+                p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
+                s.id as supermercado_id, s.nombre as supermarket, s.url_logo, 
+                pp.precio as price, pp.precio_anterior, pp.url_producto 
+            FROM productos p 
+            JOIN precios_productos pp ON p.id = pp.producto_id 
+            JOIN supermercados s ON pp.supermercado_id = s.id 
+            WHERE p.id IN (?)
+        `, [todosLosIds]);
+
+        const [sucursales] = await pool.query("SELECT * FROM sucursales WHERE latitud IS NOT NULL AND longitud IS NOT NULL");
+
+        const obtenerColores = (nombreSuper) => {
+            const lower = nombreSuper.toLowerCase();
+            if (lower.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' };
+            if (lower.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' };
+            if (lower.includes('unimarc')) return { bgColor: '#FEF3C7', textColor: '#B45309' };
+            return { bgColor: '#DCFCE7', textColor: '#15803D' };
+        };
+
+        const productosMap = {};
+        rows.forEach(row => {
+            if (!productosMap[row.id]) {
+                let nutricionObj = null;
+                if (row.info_nutricional) {
+                    try { nutricionObj = typeof row.info_nutricional === 'string' ? JSON.parse(row.info_nutricional) : row.info_nutricional; } catch (e) {}
+                }
+                productosMap[row.id] = { id: row.id, name: row.name, brand: row.brand, url_imagen: row.url_imagen, nutrition: nutricionObj, all_prices: [] };
+            }
+
+            const idxExistente = productosMap[row.id].all_prices.findIndex(p => Number(p.supermercado_id) === Number(row.supermercado_id));
+            const sucInfo = obtenerSucursalDeMarca(sucursales, row.supermercado_id, userLat, userLon);
+
+            const nuevoPrecioObj = { 
+                supermercado_id: row.supermercado_id,
+                supermarket: row.supermarket, 
+                price: row.price, 
+                precio_anterior: row.precio_anterior,
+                escaneado_en: row.escaneado_en,
+                url_producto: row.url_producto, 
+                url_logo: row.url_logo,
+                nombre_local: sucInfo ? sucInfo.nombre_local : null,
+                direccion: sucInfo ? sucInfo.direccion : null,
+                latitud: sucInfo ? sucInfo.latitud : null,
+                longitud: sucInfo ? sucInfo.longitud : null,
+                distancia_str: sucInfo ? sucInfo.distancia_str : null,
+                distancia_km: sucInfo ? sucInfo.distancia_km : null
+            };
+
+            if (idxExistente === -1) {
+                productosMap[row.id].all_prices.push(nuevoPrecioObj);
+            } else if (row.price < productosMap[row.id].all_prices[idxExistente].price) {
+                productosMap[row.id].all_prices[idxExistente] = nuevoPrecioObj;
+            }
+        });
+
+        const formatearProducto = (prod) => {
+            if (!prod || prod.all_prices.length === 0) return null;
+            prod.all_prices.sort((a, b) => a.price - b.price);
+            const cheapest = prod.all_prices[0];
+            const col = obtenerColores(cheapest.supermarket);
+            return {
+                id: prod.id, name: prod.name, brand: prod.brand, image_url: prod.url_imagen, nutrition: prod.nutrition,
+                supermarket: cheapest.supermarket, price: '$ ' + cheapest.price.toLocaleString('es-CL'),
+                url_logo: cheapest.url_logo, bgColor: col.bgColor, textColor: col.textColor,
+                all_prices: prod.all_prices.map(p => {
+                    const c = obtenerColores(p.supermarket);
+                    return { ...p, priceStr: '$ ' + p.price.toLocaleString('es-CL'), bgColor: c.bgColor, textColor: c.textColor };
+                })
+            };
+        };
+
+        const productoPrincipal = formatearProducto(productosMap[prodBase.id]);
+        const productosSimilares = idsSimilares.map(id => formatearProducto(productosMap[id])).filter(Boolean);
+
+        res.json({
+            encontrado: true,
+            producto: productoPrincipal,
+            similares: productosSimilares
+        });
+    } catch (error) {
+        console.error("Error en escanear:", error);
+        res.status(500).json({ error: 'Error al procesar el código escaneado' });
+    }
+});
+
+
+// ==========================================
+// INICIALIZAR TABLAS DE NOTIFICACIONES Y AHORRO MENSUAL
+// ==========================================
+async function inicializarTablasExtras() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS notificaciones_usuario (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                usuario_id INT NOT NULL,
+                producto_id INT NOT NULL,
+                supermercado VARCHAR(100),
+                precio_anterior INT,
+                precio_nuevo INT,
+                leida TINYINT(1) DEFAULT 0,
+                fecha DATE NOT NULL,
+                creado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_notif_dia (usuario_id, producto_id, supermercado, fecha)
+            )
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_compras_usuario (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                usuario_id INT NOT NULL,
+                lista_id INT,
+                total_pagado INT NOT NULL,
+                ahorro_logrado INT NOT NULL,
+                detalle_json JSON,
+                fecha DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+    } catch (e) {
+        console.error("Error creando tablas extras:", e.message);
+    }
+}
+inicializarTablasExtras();
+
+// ==========================================
+// RUTA: NOTIFICACIONES DE BAJADA DE PRECIO (PRODUCTOS EN LISTAS)
+// ==========================================
+app.get('/api/notificaciones', verificarToken, async (req, res) => {
+    const usuario_id = req.user.id;
+    try {
+        // 1. Detectar productos guardados en las listas del usuario que bajaron de precio
+        const [bajadas] = await pool.query(`
+            SELECT DISTINCT
+                f.producto_id,
+                s.nombre AS supermercado,
+                pp.precio AS precio_nuevo,
+                COALESCE(pp.precio_anterior, f.precio_objetivo) AS precio_ant
+            FROM favoritos f
+            JOIN precios_productos pp ON f.producto_id = pp.producto_id
+            JOIN supermercados s ON pp.supermercado_id = s.id
+            WHERE f.usuario_id = ?
+              AND (
+                  (pp.precio_anterior IS NOT NULL AND pp.precio < pp.precio_anterior)
+                  OR (f.precio_objetivo IS NOT NULL AND pp.precio < f.precio_objetivo)
+              )
+        `, [usuario_id]);
+
+        for (const b of bajadas) {
+            await pool.query(`
+                INSERT IGNORE INTO notificaciones_usuario 
+                (usuario_id, producto_id, supermercado, precio_anterior, precio_nuevo, fecha)
+                VALUES (?, ?, ?, ?, ?, CURDATE())
+            `, [usuario_id, b.producto_id, b.supermercado, b.precio_ant, b.precio_nuevo]);
+        }
+
+        // 2. Devolver el historial de notificaciones con la foto y datos del producto
+        const [notifs] = await pool.query(`
+            SELECT 
+                n.id, n.producto_id, n.supermercado, n.precio_anterior, n.precio_nuevo, 
+                n.leida, n.creado_en,
+                p.nombre, p.marca, p.url_imagen
+            FROM notificaciones_usuario n
+            JOIN productos p ON n.producto_id = p.id
+            WHERE n.usuario_id = ?
+            ORDER BY n.creado_en DESC
+            LIMIT 30
+        `, [usuario_id]);
+
+        res.json(notifs);
+    } catch (error) {
+        console.error("Error en notificaciones:", error);
+        res.status(500).json({ error: 'Error al obtener notificaciones' });
+    }
+});
+
+app.put('/api/notificaciones/leer', verificarToken, async (req, res) => {
+    const usuario_id = req.user.id;
+    try {
+        await pool.query("UPDATE notificaciones_usuario SET leida = 1 WHERE usuario_id = ?", [usuario_id]);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al marcar notificaciones' });
+    }
+});
+
+// ==========================================
+// RUTA: REGISTRAR LISTA COMPRADA Y CALCULAR AHORRO DEL MES EN CURSO
+// ==========================================
+app.post('/api/compras/registrar', verificarToken, async (req, res) => {
+    const usuario_id = req.user.id;
+    const { lista_id, total_pagado, ahorro_logrado, items } = req.body;
+    try {
+        await pool.query(
+            "INSERT INTO historial_compras_usuario (usuario_id, lista_id, total_pagado, ahorro_logrado, detalle_json, fecha) VALUES (?, ?, ?, ?, ?, NOW())",
+            [usuario_id, lista_id || null, total_pagado || 0, ahorro_logrado || 0, JSON.stringify(items || [])]
+        );
+        res.json({ mensaje: 'Compra registrada con éxito', ahorro_logrado });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al registrar compra' });
+    }
+});
+
+app.get('/api/perfil/resumen-mes', verificarToken, async (req, res) => {
+    const usuario_id = req.user.id;
+    try {
+        const [ahorroRows] = await pool.query(`
+            SELECT 
+                COALESCE(SUM(ahorro_logrado), 0) AS ahorro_mes,
+                COALESCE(SUM(total_pagado), 0) AS gastado_mes,
+                COUNT(id) AS compras_mes
+            FROM historial_compras_usuario
+            WHERE usuario_id = ?
+              AND MONTH(fecha) = MONTH(CURDATE())
+              AND YEAR(fecha) = YEAR(CURDATE())
+        `, [usuario_id]);
+
+        const [listasRows] = await pool.query(
+            "SELECT COUNT(id) AS total_listas FROM listas_compras WHERE usuario_id = ?",
+            [usuario_id]
+        );
+
+        res.json({
+            ahorro_mes: Number(ahorroRows[0].ahorro_mes || 0),
+            gastado_mes: Number(ahorroRows[0].gastado_mes || 0),
+            compras_mes: Number(ahorroRows[0].compras_mes || 0),
+            total_listas: Number(listasRows[0].total_listas || 0)
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al obtener resumen mensual' });
     }
 });
 
