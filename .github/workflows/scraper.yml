@@ -2,17 +2,17 @@ name: Automatizar Scrapers de Precios
 
 on:
   schedule:
-    # 4:00 AM UTC equivale a la 1:00 AM en Chile (UTC-3)
-    - cron: '0 4 * * 1,5'
+    # Se ejecuta Lunes (1) y Viernes (5) a las 6:00 AM UTC (3:00 AM Hora Chile)
+    - cron: '0 6 * * 1,5'
   workflow_dispatch: # Permite ejecutarlo manualmente desde la pestaña Actions en GitHub
-  
+
 jobs:
   ejecutar-scrapers:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # Límite de seguridad de quase 6 horas
+    timeout-minutes: 350
 
     env:
-      CI: true
+      TZ: America/Santiago
       DB_HOST: ${{ secrets.DB_HOST }}
       DB_USER: ${{ secrets.DB_USER }}
       DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
@@ -34,26 +34,22 @@ jobs:
           npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
           npx puppeteer browsers install chrome
 
-      - name: Sincronizar Sucursales Nacionales
+      - name: Ejecutar Scraper Tottus (Con Monitor Virtual Xvfb)
         continue-on-error: true
-        run: node importarSucursalesMasivoNacional.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperTottus.js
 
-      - name: Ejecutar Scraper Lider
+      - name: Ejecutar Scraper Lider (Con Monitor Virtual Xvfb)
         continue-on-error: true
-        run: node scraperLider.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperLider.js
 
       - name: Ejecutar Scraper Jumbo
         continue-on-error: true
-        run: node scraperJumbo.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperJumbo.js
 
       - name: Ejecutar Scraper Santa Isabel
         continue-on-error: true
-        run: node scraperSantaIsabel.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperSantaIsabel.js
 
       - name: Ejecutar Scraper Unimarc
         continue-on-error: true
-        run: node scraperUnimarc.js
-
-      - name: Ejecutar Scraper Tottus
-        continue-on-error: true
-        run: node scraperTottus.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperUnimarc.js

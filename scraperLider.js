@@ -60,15 +60,11 @@ const urlsLider = [
     'https://super.lider.cl/browse/limpieza-y-aseo/insecticidas-y-control-de-plagas/43390617_74938748'
 ];
 
-// Función que convierte los códigos de 12 dígitos de Lider al estándar EAN-13 completo y quita ceros iniciales
 function normalizarEAN13(codigo) {
     if (!codigo) return null;
-    
     let limpio = codigo.toString().trim().replace(/^0+/, '');
 
-    if (limpio.length === 13) {
-        return limpio;
-    }
+    if (limpio.length === 13) return limpio;
 
     if (limpio.length === 12 && /^\d{12}$/.test(limpio)) {
         let suma = 0;
@@ -80,7 +76,6 @@ function normalizarEAN13(codigo) {
         const digitoVerificador = resto === 0 ? 0 : 10 - resto;
         return limpio + digitoVerificador.toString();
     }
-
     return limpio;
 }
 
@@ -88,29 +83,50 @@ async function explorarLider() {
     try {
         console.log('1. Verificando supermercado Lider en la base de datos...');
         let supermercadoId;
-        const [supermercados] = await pool.query("SELECT id FROM supermercados WHERE nombre = 'Lider'");
+        const [supermercados] = await pool.query("SELECT id FROM supermercados WHERE LOWER(nombre) = 'lider'");
         
         if (supermercados.length > 0) {
             supermercadoId = supermercados[0].id;
         } else {
-            const [nuevoSuper] = await pool.query("INSERT INTO supermercados (nombre, direccion) VALUES (?, ?)", ['Lider', 'Curicó']);
+            const [nuevoSuper] = await pool.query(
+                "INSERT INTO supermercados (nombre, url_logo) VALUES (?, ?)",
+                ['Lider', 'https://www.google.com/s2/favicons?domain=lider.cl&sz=128']
+            );
             supermercadoId = nuevoSuper.insertId;
         }
 
-        console.log('2. Iniciando navegador Puppeteer...');
+        console.log('2. Iniciando navegador Puppeteer (Modo Ventana Real con Xvfb)...');
         const browser = await puppeteer.launch({ 
-            headless: process.env.CI ? 'new' : false, 
-            defaultViewport: null,
+            headless: false, // Con xvfb-run en GitHub Actions abre ventana real sin ser detectado como HeadlessChrome
+            defaultViewport: { width: 1366, height: 768 },
             args: [
-                '--start-maximized',
+                '--window-size=1366,768',
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage'
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--lang=es-CL,es'
             ]
         });
         const page = await browser.newPage();
 
-        // Contadores Globales para el reporte final
+        await page.setUserAgent(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        );
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
+            'Upgrade-Insecure-Requests': '1'
+        });
+        try {
+            await page.emulateTimezone('America/Santiago');
+        } catch (e) {}
+
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-CL', 'es'] });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        });
+
         let totalNuevosGlobal = 0;
         let totalExistentesGlobal = 0;
 
@@ -122,36 +138,90 @@ async function explorarLider() {
                 const urlActual = `${urlCategoria}?page=${numPagina}`;
                 console.log(`➡️ PÁGINA ${numPagina}: ${urlActual}`);
                 
-                await page.goto(urlActual, { waitUntil: 'networkidle2', timeout: 60000 }); 
+                await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 }); 
+                try {
+                    await page.waitForSelector('div[role="group"], [data-automation-id="product-title"], #__NEXT_DATA__', { timeout: 12000 });
+                } catch (_) {}
+
                 console.log('Esperando a que cargue...');
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                await new Promise(resolve => setTimeout(resolve, 4500));
+
+                const tituloCargado = await page.title();
+                console.log(`📄 Título en Lider: "${tituloCargado}"`);
 
                 console.log('Bajando por la página para cargar todas las imágenes...');
                 await page.evaluate(async () => {
                     await new Promise((resolve) => {
                         let totalHeight = 0;
-                        let distance = 150; 
+                        let distance = 200; 
+                        let steps = 0;
                         let timer = setInterval(() => {
-                            let scrollHeight = document.body.scrollHeight;
+                            let scrollHeight = document.body ? document.body.scrollHeight : 0;
                             window.scrollBy(0, distance);
                             totalHeight += distance;
-                            if(totalHeight >= scrollHeight - window.innerHeight){ clearInterval(timer); resolve(); }
+                            steps++;
+                            if (totalHeight >= scrollHeight - window.innerHeight || steps > 35) {
+                                clearInterval(timer);
+                                resolve();
+                            }
                         }, 100);
                     });
                 });
 
                 const productosExtraidos = await page.evaluate(() => {
-                    const cajasDeProducto = document.querySelectorAll('div[role="group"]');
                     const resultados = [];
-                    
+                    const nombresVistos = new Set();
+
+                    // MÉTODO 1: Extraer desde __NEXT_DATA__ (JSON interno de Walmart/Lider)
+                    try {
+                        const nextEl = document.getElementById('__NEXT_DATA__');
+                        if (nextEl) {
+                            const nextData = JSON.parse(nextEl.textContent);
+                            const stacks = nextData?.props?.pageProps?.initialData?.searchResult?.itemStacks || [];
+                            stacks.forEach(stack => {
+                                const items = stack?.items || [];
+                                items.forEach(it => {
+                                    if (!it || it.__typename !== 'Product') return;
+                                    const nombre = (it.name || '').trim();
+                                    const marca = (it.brand || 'Sin marca').trim();
+                                    const canonical = it.canonicalUrl || '';
+                                    const url_producto = canonical.startsWith('http') ? canonical : `https://super.lider.cl${canonical}`;
+                                    const url_imagen = it.imageInfo?.thumbnailUrl || null;
+
+                                    let codigo_barras = null;
+                                    const mUrl = url_producto.match(/\/ip\/[^\/]+\/(\d+)$/);
+                                    if (mUrl && mUrl[1] && mUrl[1].length >= 12) {
+                                        codigo_barras = mUrl[1];
+                                    }
+
+                                    let precio = 0;
+                                    const pInfo = it.priceInfo?.currentPrice?.price || it.priceInfo?.linePrice || '';
+                                    if (typeof pInfo === 'number') {
+                                        precio = pInfo;
+                                    } else if (pInfo) {
+                                        precio = parseInt(pInfo.toString().replace(/[^0-9]/g, ''), 10) || 0;
+                                    }
+
+                                    if (nombre && precio > 0 && !nombresVistos.has(nombre.toLowerCase())) {
+                                        nombresVistos.add(nombre.toLowerCase());
+                                        resultados.push({ nombre, marca, precio, url_producto, url_imagen, codigo_barras });
+                                    }
+                                });
+                            });
+                        }
+                    } catch (e) {}
+
+                    // MÉTODO 2: Extraer desde las tarjetas del DOM
+                    const cajasDeProducto = document.querySelectorAll('div[role="group"]');
                     cajasDeProducto.forEach(caja => {
                         const tituloEl = caja.querySelector('[data-automation-id="product-title"]');
                         const precioEl = caja.querySelector('[data-automation-id="product-price"]');
                         const enlaceEl = caja.querySelector('a[href*="/ip/"]');
-                        const imgEl = caja.querySelector('img[data-testid="productTileImage"]');
+                        const imgEl = caja.querySelector('img[data-testid="productTileImage"], img');
                         
                         if (tituloEl && precioEl && enlaceEl) {
                             const nombre = tituloEl.innerText.trim();
+                            if (!nombre || nombresVistos.has(nombre.toLowerCase())) return;
                             
                             let marca = 'Sin marca';
                             const marcaEl = caja.querySelector('div.mb1.mt2.b.f6.black');
@@ -163,20 +233,19 @@ async function explorarLider() {
 
                             let codigo_barras = null;
                             const matchUrl = url_producto.match(/\/ip\/[^\/]+\/(\d+)$/);
-                            if (matchUrl && matchUrl[1]) {
-                                if (matchUrl[1].length >= 12) {
-                                    codigo_barras = matchUrl[1];
-                                }
+                            if (matchUrl && matchUrl[1] && matchUrl[1].length >= 12) {
+                                codigo_barras = matchUrl[1];
                             }
                             
                             const precioTexto = precioEl.innerText;
                             let precio = 0;
                             const matchPrecio = precioTexto.match(/\$\s?([\d\.]+)/);
                             if (matchPrecio) {
-                                precio = parseInt(matchPrecio[1].replace(/\./g, '')) || 0;
+                                precio = parseInt(matchPrecio[1].replace(/\./g, ''), 10) || 0;
                             }
                             
                             if (precio > 0) {
+                                nombresVistos.add(nombre.toLowerCase());
                                 resultados.push({ nombre, marca, precio, url_producto, url_imagen, codigo_barras });
                             }
                         }
@@ -192,15 +261,12 @@ async function explorarLider() {
                 }
 
                 console.log('Guardando en MySQL...');
-                
-                // Contadores locales por página
                 let nuevosPagina = 0;
                 let existentesPagina = 0;
 
                 for (const prod of productosExtraidos) {
                     let productoId;
                     
-                    // APLICAMOS LA NORMALIZACIÓN AQUÍ ANTES DE GUARDAR O BUSCAR
                     if (prod.codigo_barras) {
                         prod.codigo_barras = normalizarEAN13(prod.codigo_barras);
                     }
@@ -240,12 +306,15 @@ async function explorarLider() {
 
                     if (precioExistente.length > 0) {
                         const ultimoPrecio = precioExistente[0];
-                        const esMismoDia = ultimoPrecio.fecha_scan && ultimoPrecio.fecha_scan.toISOString().split('T')[0] === new Date().toISOString().split('T')[0];
+                        const fechaScanStr = ultimoPrecio.fecha_scan instanceof Date
+                            ? ultimoPrecio.fecha_scan.toISOString().split('T')[0]
+                            : String(ultimoPrecio.fecha_scan).split('T')[0];
+                        const esMismoDia = fechaScanStr === new Date().toISOString().split('T')[0];
                         
-                        if (esMismoDia && ultimoPrecio.precio === prod.precio) {
-                             necesitaActualizarPrecio = false;
+                        if (esMismoDia && Number(ultimoPrecio.precio) === Number(prod.precio)) {
+                            necesitaActualizarPrecio = false;
                         } else if (!esMismoDia) {
-                            if (ultimoPrecio.precio !== prod.precio) {
+                            if (Number(ultimoPrecio.precio) !== Number(prod.precio)) {
                                 await pool.query(
                                     "UPDATE precios_productos SET precio_anterior = ?, precio = ?, url_producto = ?, escaneado_en = NOW() WHERE id = ?",
                                     [ultimoPrecio.precio, prod.precio, prod.url_producto, ultimoPrecio.id]
@@ -262,7 +331,7 @@ async function explorarLider() {
                     }
 
                     if (necesitaActualizarPrecio && precioExistente.length === 0) {
-                         await pool.query(
+                        await pool.query(
                             "INSERT INTO precios_productos (producto_id, supermercado_id, precio, url_producto, escaneado_en) VALUES (?, ?, ?, ?, NOW())",
                             [productoId, supermercadoId, prod.precio, prod.url_producto]
                         );
@@ -281,9 +350,7 @@ async function explorarLider() {
                     }
                 }
                 
-                // Reporte visual al terminar la página
                 console.log(`✅ Página procesada: ${nuevosPagina} productos nuevos agregados | ${existentesPagina} ya existían (se revisó el precio).`);
-                
                 await new Promise(resolve => setTimeout(resolve, 3000));
             }
         }
@@ -299,7 +366,7 @@ async function explorarLider() {
         process.exit(0);
 
     } catch (error) {
-        console.error('❌ Error durante el scraping:', error);
+        console.error('❌ Error durante el scraping de Lider:', error);
         process.exit(1);
     }
 }
