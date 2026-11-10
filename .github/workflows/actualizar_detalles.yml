@@ -1,0 +1,51 @@
+name: Actualizar Detalles y Nutrición Mensual
+
+on:
+  schedule:
+    # Se ejecuta el día 1 de cada mes a las 4:00 AM UTC (1:00 AM Hora Chile)
+    - cron: '0 4 1 * *'
+  workflow_dispatch: # Permite dispararlo manualmente desde GitHub Actions cuando quieras
+
+jobs:
+  ejecutar-detalles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Los scripts de detalles suelen tardar más porque recorren producto por producto
+
+    env:
+      TZ: America/Santiago
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar dependencias limpias y navegador Chrome
+        run: |
+          rm -rf node_modules
+          npm install
+          npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
+          npx puppeteer browsers install chrome
+
+      - name: Ejecutar Detalles Lider
+        continue-on-error: true
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperDetallesLider.js
+
+      - name: Ejecutar Detalles Jumbo
+        continue-on-error: true
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperDetallesJumbo.js
+
+      - name: Ejecutar Detalles Santa Isabel
+        continue-on-error: true
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperDetallesSantaIsabel.js
+
+      - name: Ejecutar Detalles Unimarc
+        continue-on-error: true
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperDetallesUnimarc.js
