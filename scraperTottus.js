@@ -7,7 +7,6 @@ const pool = require('./db');
 // Categorías de Tottus a escanear
 const urlsTottus = [
     'https://www.tottus.cl/tottus-cl/lista/CATG27055/Despensa',
-
 ];
 
 // Normaliza nombres para cruzar mejor ("Arroz Grado 1 1 Kg" === "Arroz Grado 1 1kg")
