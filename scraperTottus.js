@@ -4,14 +4,13 @@ puppeteer.use(StealthPlugin());
 
 const pool = require('./db');
 
+// Categorías de Tottus a escanear
 const urlsTottus = [
     'https://www.tottus.cl/tottus-cl/lista/CATG27055/Despensa',
-    'https://www.tottus.cl/tottus-cl/lista/CATG27059/Lacteos-y-Quesos',
-    'https://www.tottus.cl/tottus-cl/lista/CATG27075/Carnes-y-Pescados',
-    'https://www.tottus.cl/tottus-cl/lista/CATG27087/Bebidas-Aguas-y-Jugos',
-    'https://www.tottus.cl/tottus-cl/lista/CATG27095/Limpieza-y-Aseo'
+
 ];
 
+// Normaliza nombres para cruzar mejor ("Arroz Grado 1 1 Kg" === "Arroz Grado 1 1kg")
 function normalizarTextoCruce(texto) {
     if (!texto) return '';
     return texto
@@ -51,6 +50,7 @@ async function explorarTottus() {
                 "INSERT INTO sucursales (supermercado_id, nombre_local, direccion, latitud, longitud) VALUES (?, ?, ?, ?, ?)",
                 [supermercadoId, 'Tottus Curicó', 'Av. Freire 70, Curicó', -34.9839, -71.2335]
             );
+            console.log('📍 Sucursal Tottus Curicó registrada automáticamente.');
         }
 
         console.log('2. Cargando catálogo actual de productos para cruce inteligente...');
@@ -70,7 +70,7 @@ async function explorarTottus() {
 
         console.log('3. Iniciando navegador Stealth Puppeteer para Tottus...');
         const browser = await puppeteer.launch({ 
-            headless: false, 
+            headless: process.env.CI ? 'new' : false, 
             defaultViewport: { width: 1366, height: 768 },
             args: [
                 '--window-size=1366,768',
@@ -101,6 +101,7 @@ async function explorarTottus() {
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         });
 
+        // Captura respuestas JSON internas de la red
         let productosCapturadosRed = [];
         page.on('response', async (response) => {
             try {
@@ -161,22 +162,18 @@ async function explorarTottus() {
                     console.log('⚠️ Timeout de red controlado, continuando...');
                 }
 
-                // Pausa para que Cloudflare resuelva el desafío anti-bot
                 console.log('Esperando resolución de seguridad de Tottus...');
                 await new Promise(resolve => setTimeout(resolve, 8000));
 
                 let tituloPagina = await page.title();
                 console.log(`📄 Título en Tottus: "${tituloPagina}"`);
 
-                // Si detecta "Un momento...", simulamos interacción humana para forzar la validación
                 if (tituloPagina.includes('Un momento') || tituloPagina.includes('Just a moment')) {
                     console.log('🛡️ Escudo Cloudflare detectado, simulando movimiento de mouse...');
                     await page.mouse.move(120, 250);
                     await page.mouse.down();
                     await page.mouse.up();
                     await new Promise(resolve => setTimeout(resolve, 6000));
-                    tituloPagina = await page.title();
-                    console.log(`📄 Título tras simulación: "${tituloPagina}"`);
                 }
 
                 console.log('Bajando por la página para cargar todas las imágenes (Lazy Load)...');
@@ -199,6 +196,7 @@ async function explorarTottus() {
                 });
                 await new Promise(resolve => setTimeout(resolve, 2500));
 
+                // Extracción limpia basada exclusivamente en __NEXT_DATA__ para evitar el texto basura ("word word...")
                 const productosDOM = await page.evaluate(() => {
                     const resultados = [];
                     const urlsVistas = new Set();
@@ -244,79 +242,6 @@ async function explorarTottus() {
                         }
                     } catch (e) {}
 
-                    const selectoresTarjetas = [
-                        '[data-pod="catalyst-pod"]',
-                        'div.pod',
-                        'a.pod-link',
-                        'li[class*="product"]',
-                        'div[class*="search-results"] div[class*="pod"]'
-                    ];
-
-                    let tarjetas = [];
-                    for (const sel of selectoresTarjetas) {
-                        const encontrados = document.querySelectorAll(sel);
-                        if (encontrados.length > 0) {
-                            tarjetas = Array.from(encontrados);
-                            break;
-                        }
-                    }
-
-                    if (tarjetas.length === 0) {
-                        const links = document.querySelectorAll('a[href*="/tottus-cl/articulo/"], a[href*="/tottus-cl/product/"]');
-                        links.forEach(l => {
-                            const contenedor = l.closest('[data-pod], div.pod, li') || l;
-                            if (!tarjetas.includes(contenedor)) tarjetas.push(contenedor);
-                        });
-                    }
-
-                    tarjetas.forEach(caja => {
-                        const nombreEl = caja.querySelector('b.pod-subTitle, [class*="pod-subTitle"], [id*="testId-pod-displaySubTitle"], h2, h3');
-                        const marcaEl = caja.querySelector('b.pod-title, [class*="pod-title"], [id*="testId-pod-displayTitle"]');
-                        const enlaceEl = caja.tagName === 'A' ? caja : caja.querySelector('a[href]');
-                        const imgEl = caja.querySelector('img');
-
-                        if (!nombreEl || !enlaceEl) return;
-
-                        const nombre = nombreEl.innerText.trim();
-                        if (!nombre || urlsVistas.has(nombre.toLowerCase())) return;
-
-                        const marca = marcaEl ? marcaEl.innerText.trim() : 'Sin marca';
-                        const href = enlaceEl.getAttribute('href') || '';
-                        const url_producto = href.startsWith('http') ? href : `https://www.tottus.cl${href}`;
-                        const url_imagen = imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null;
-
-                        let precio = 0;
-                        const nodosPrecio = caja.querySelectorAll('li[data-internet-price], li[data-cmr-price], li[data-event-price], span.copy10, [class*="prices"] span, [class*="price"]');
-                        
-                        if (nodosPrecio.length > 0) {
-                            for (const nodo of nodosPrecio) {
-                                const attrPrecio = nodo.getAttribute('data-internet-price') || nodo.getAttribute('data-cmr-price') || nodo.getAttribute('data-event-price');
-                                if (attrPrecio) {
-                                    const num = parseInt(attrPrecio.replace(/\./g, '').replace(/[^0-9]/g, ''), 10);
-                                    if (num > 0 && (precio === 0 || num < precio)) precio = num;
-                                } else {
-                                    const m = (nodo.innerText || '').match(/\$\s?([\d\.]+)/);
-                                    if (m) {
-                                        const num = parseInt(m[1].replace(/\./g, ''), 10);
-                                        if (num > 0 && (precio === 0 || num < precio)) precio = num;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (precio === 0) {
-                            const matchTexto = (caja.innerText || '').match(/\$\s?([\d\.]+)/);
-                            if (matchTexto) {
-                                precio = parseInt(matchTexto[1].replace(/\./g, ''), 10) || 0;
-                            }
-                        }
-
-                        if (nombre && precio > 0) {
-                            urlsVistas.add(nombre.toLowerCase());
-                            resultados.push({ nombre, marca, precio, url_producto, url_imagen });
-                        }
-                    });
-
                     return resultados;
                 });
 
@@ -329,10 +254,10 @@ async function explorarTottus() {
                 });
                 const productosExtraidos = Array.from(mapaUnicosPagina.values());
 
-                console.log(`¡Se extrajeron ${productosExtraidos.length} productos de esta página!`);
+                console.log(`¡Se extrajeron ${productosExtraidos.length} productos limpios de esta página!`);
 
                 if (productosExtraidos.length === 0) {
-                    console.log('⚠️ No se detectaron productos en esta página. Pasando a la siguiente categoría...');
+                    console.log('⚠️ No se detectaron más productos en esta categoría. Pasando a la siguiente...');
                     break;
                 }
 
@@ -436,7 +361,7 @@ async function explorarTottus() {
         console.log('🚀 ¡PROCESO DE TOTTUS COMPLETADO!');
         console.log(`📊 RESUMEN FINAL:`);
         console.log(`   - 🔗 Precios de Tottus añadidos/actualizados a productos existentes: ${totalActualizadosGlobal}`);
-        console.log(`   - 🚫 Productos de Tottus omitidos (no estaban em tu BD): ${totalOmitidosGlobal}`);
+        console.log(`   - 🚫 Productos de Tottus omitidos (no estaban en tu BD): ${totalOmitidosGlobal}`);
         console.log('======================================================\n');
 
         await browser.close();
