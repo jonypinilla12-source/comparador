@@ -68,9 +68,9 @@ async function explorarTottus() {
         }
         console.log(`📦 ${catalogoActual.length} productos base listos para cruzar.`);
 
-        console.log('3. Iniciando navegador Puppeteer (Modo Ventana Real con Xvfb)...');
+        console.log('3. Iniciando navegador Stealth Puppeteer para Tottus...');
         const browser = await puppeteer.launch({ 
-            headless: false, // Con xvfb-run en GitHub Actions abre navegador completo sin marca HeadlessChrome
+            headless: false, 
             defaultViewport: { width: 1366, height: 768 },
             args: [
                 '--window-size=1366,768',
@@ -155,16 +155,29 @@ async function explorarTottus() {
                 const urlActual = `${urlCategoria}${separador}page=${numPagina}`;
                 console.log(`➡️ PÁGINA ${numPagina}: ${urlActual}`);
                 
-                await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                
                 try {
-                    await page.waitForSelector('[data-pod="catalyst-pod"], div.pod, b.pod-subTitle, #__NEXT_DATA__', { timeout: 12000 });
-                } catch (_) {}
+                    await page.goto(urlActual, { waitUntil: 'networkidle0', timeout: 60000 });
+                } catch (err) {
+                    console.log('⚠️ Timeout de red controlado, continuando...');
+                }
 
-                await new Promise(resolve => setTimeout(resolve, 4500));
+                // Pausa para que Cloudflare resuelva el desafío anti-bot
+                console.log('Esperando resolución de seguridad de Tottus...');
+                await new Promise(resolve => setTimeout(resolve, 8000));
 
-                const tituloPagina = await page.title();
+                let tituloPagina = await page.title();
                 console.log(`📄 Título en Tottus: "${tituloPagina}"`);
+
+                // Si detecta "Un momento...", simulamos interacción humana para forzar la validación
+                if (tituloPagina.includes('Un momento') || tituloPagina.includes('Just a moment')) {
+                    console.log('🛡️ Escudo Cloudflare detectado, simulando movimiento de mouse...');
+                    await page.mouse.move(120, 250);
+                    await page.mouse.down();
+                    await page.mouse.up();
+                    await new Promise(resolve => setTimeout(resolve, 6000));
+                    tituloPagina = await page.title();
+                    console.log(`📄 Título tras simulación: "${tituloPagina}"`);
+                }
 
                 console.log('Bajando por la página para cargar todas las imágenes (Lazy Load)...');
                 await page.evaluate(async () => {
@@ -423,7 +436,7 @@ async function explorarTottus() {
         console.log('🚀 ¡PROCESO DE TOTTUS COMPLETADO!');
         console.log(`📊 RESUMEN FINAL:`);
         console.log(`   - 🔗 Precios de Tottus añadidos/actualizados a productos existentes: ${totalActualizadosGlobal}`);
-        console.log(`   - 🚫 Productos de Tottus omitidos (no estaban en tu BD): ${totalOmitidosGlobal}`);
+        console.log(`   - 🚫 Productos de Tottus omitidos (no estaban em tu BD): ${totalOmitidosGlobal}`);
         console.log('======================================================\n');
 
         await browser.close();
