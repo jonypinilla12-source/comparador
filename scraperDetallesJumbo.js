@@ -64,10 +64,17 @@ async function rasparDetallesJumbo() {
         console.log(`¡Vamos a raspar ${productos.length} productos usando concurrencia (Modo Pulpo)!`);
 
         const browser = await puppeteer.launch({ 
-            headless: false, 
-            defaultViewport: null,
-            args: ['--start-maximized']
-        }); 
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: { width: 1366, height: 768 },
+            args: [
+                '--start-maximized',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu'
+            ]
+        });
 
         // Lote reducido a 10 para mayor estabilidad SQL
         const lotes = dividirEnLotes(productos, 10);

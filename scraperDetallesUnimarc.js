@@ -34,15 +34,17 @@ async function rasparDetallesUnimarc() {
         console.log(`¡Vamos a raspar los nutrientes de ${productos.length} productos de Unimarc de forma sigilosa!`);
 
         const browser = await puppeteer.launch({ 
-            headless: false, 
-            defaultViewport: null,
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: { width: 1366, height: 768 },
             args: [
-                '--start-maximized', 
-                '--no-sandbox', 
+                '--start-maximized',
+                '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled'
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu'
             ]
-        }); 
+        });
 
         // BAJAMOS LA CONCURRENCIA A 2 PARA NO DESPERTAR AL FIREWALL DE AKAMAI
         const lotes = dividirEnLotes(productos, 10);

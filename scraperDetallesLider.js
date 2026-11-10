@@ -57,10 +57,17 @@ async function rasparDetallesLider() {
         console.log(`¡Vamos a raspar ${productos.length} productos en Modo Pulpo!`);
 
         const browser = await puppeteer.launch({ 
-            headless: false, 
-            defaultViewport: null,
-            args: ['--start-maximized']
-        }); 
+            headless: process.env.CI ? 'new' : false, 
+            defaultViewport: { width: 1366, height: 768 },
+            args: [
+                '--start-maximized',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu'
+            ]
+        });
 
         const lotes = dividirEnLotes(productos, 30);
         let procesados = 0;
