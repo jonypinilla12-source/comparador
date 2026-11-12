@@ -7,6 +7,16 @@ const pool = require('./db');
 // Categorías de Tottus a escanear
 const urlsTottus = [
     'https://www.tottus.cl/tottus-cl/lista/CATG27055/Despensa',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27069/Carnes',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27070/Frutas-y-Verduras',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27139/Lacteos-y-Quesos',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27109/Fiambres-y-Huevos',
+    'https://www.tottus.cl/tottus-cl/lista/CATG29182/Bebestibles',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27075/Panaderia-y-Pasteleria',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27073/Congelados',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27074/Aseo-y-Limpieza',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27087/Mundo-Bebe',
+    'https://www.tottus.cl/tottus-cl/lista/CATG27084/Cuidado-Personal'
 ];
 
 // Normaliza nombres para cruzar mejor ("Arroz Grado 1 1 Kg" === "Arroz Grado 1 1kg")

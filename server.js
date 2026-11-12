@@ -6,7 +6,15 @@ const { OAuth2Client } = require('google-auth-library');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cron = require('node-cron');
+const admin = require('firebase-admin');
 require('dotenv').config();
+
+// Inicializar Firebase Admin con la clave de servicio
+const serviceAccount = require('./firebase-key.json');
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
 
 // Importamos la conexión a la base de datos
 const pool = require('./db'); 
@@ -186,6 +194,23 @@ app.post('/api/login-google', async (req, res) => {
 });
 
 // ==========================================
+// REGISTRAR TOKEN FCM
+// ==========================================
+app.post('/api/usuario/fcm-token', verificarToken, async (req, res) => {
+    const usuario_id = req.user.id;
+    const { fcm_token } = req.body;
+    try {
+        await pool.query(
+            "UPDATE usuarios SET fcm_token = ? WHERE id = ?",
+            [fcm_token, usuario_id]
+        );
+        res.json({ mensaje: 'Token FCM actualizado correctamente' });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al actualizar token FCM' });
+    }
+});
+
+// ==========================================
 // GESTIÓN DE LISTAS DE COMPRAS
 // ==========================================
 app.get('/api/listas', verificarToken, async (req, res) => {
@@ -213,48 +238,100 @@ app.post('/api/listas', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// PRODUCTOS Y RECETAS
+// RUTA: ELIMINAR UNA LISTA COMPLETA Y SUS PRODUCTOS
+// ==========================================
+app.delete('/api/listas/:id', verificarToken, async (req, res) => {
+    const listaId = parseInt(req.params.id);
+    const usuarioId = req.user.id;
+
+    try {
+        await pool.query(
+            "DELETE FROM favoritos WHERE lista_id = ? AND usuario_id = ?",
+            [listaId, usuarioId]
+        );
+        await pool.query(
+            "DELETE FROM listas_compras WHERE id = ? AND usuario_id = ?",
+            [listaId, usuarioId]
+        );
+
+        res.json({ mensaje: 'Lista eliminada correctamente' });
+    } catch (error) {
+        console.error('Error al eliminar lista:', error);
+        res.status(500).json({ error: 'Error al eliminar la lista' });
+    }
+});
+
+// ==========================================
+// RUTA: EXPLORAR PRODUCTOS
 // ==========================================
 app.get('/api/productos', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
-    const busqueda = req.query.busqueda || '';
-    const categoria = req.query.categoria || '';
+    const categoria = req.query.categoria;
+    const busqueda = req.query.busqueda;
     const userLat = parseFloat(req.query.lat);
     const userLon = parseFloat(req.query.lon);
 
     try {
-        let whereClause = "WHERE 1=1";
-        let paramsCount = [];
+        let whereClause = "";
+        let queryParams = [];
+        let orderClause = `
+            COUNT(DISTINCT pp.supermercado_id) DESC,
+            MAX(CASE WHEN pp.precio_anterior IS NOT NULL AND pp.precio < pp.precio_anterior THEN (pp.precio_anterior - pp.precio) ELSE 0 END) DESC,
+            MAX(pp.escaneado_en) DESC,
+            MIN(pp.precio) ASC
+        `;
 
-        if (busqueda) {
-            whereClause += " AND (p.nombre LIKE ? OR p.marca LIKE ? OR p.codigo_barras LIKE ?)";
-            const term = `%${busqueda}%`;
-            paramsCount.push(term, term, term);
+        if (busqueda && busqueda.trim() !== '') {
+            const palabras = busqueda.trim().split(/\s+/);
+            const condiciones = palabras.map(() => `(p.nombre LIKE ? OR p.marca LIKE ? OR p.codigo_barras LIKE ?)`);
+            whereClause = "WHERE " + condiciones.join(" AND ");
+            
+            palabras.forEach(palabra => {
+                const term = `%${palabra}%`;
+                queryParams.push(term, term, term);
+            });
+
+            const primeraPalabra = `${palabras[0]}%`;
+            const fraseExacta = `%${busqueda.trim()}%`;
+            orderClause = `
+                (CASE 
+                    WHEN p.nombre LIKE ${pool.escape(primeraPalabra)} THEN 0 
+                    WHEN p.nombre LIKE ${pool.escape(fraseExacta)} THEN 1 
+                    ELSE 2 
+                END),
+                COUNT(DISTINCT pp.supermercado_id) DESC,
+                MIN(pp.precio) ASC
+            `;
+        } else if (categoria && categoria !== 'Todos') {
+            whereClause = "WHERE p.categoria = ?";
+            queryParams.push(categoria);
         }
 
-        if (categoria && categoria.toLowerCase() !== 'todos') {
-            whereClause += " AND p.categoria = ?";
-            paramsCount.push(categoria);
+        const [countResult] = await pool.query(
+            `SELECT COUNT(DISTINCT p.id) as total FROM productos p JOIN precios_productos pp ON p.id = pp.producto_id ${whereClause}`,
+            queryParams
+        );
+        const totalProducts = countResult[0].total;
+        const totalPages = Math.ceil(totalProducts / limit) || 1;
+
+        const queryIds = `
+            SELECT p.id 
+            FROM productos p
+            JOIN precios_productos pp ON p.id = pp.producto_id
+            ${whereClause}
+            GROUP BY p.id
+            ORDER BY ${orderClause}
+            LIMIT ? OFFSET ?
+        `;
+        const [idRows] = await pool.query(queryIds, [...queryParams, limit, offset]);
+
+        if (idRows.length === 0) {
+            return res.json({ data: [], currentPage: page, totalPages: 1 });
         }
 
-        const countQuery = `SELECT COUNT(DISTINCT p.id) as total FROM productos p ${whereClause}`;
-        const [countResult] = await pool.query(countQuery, paramsCount);
-        const totalItems = countResult[0].total;
-        const totalPages = Math.ceil(totalItems / limit);
-
-        if (totalItems === 0) {
-            return res.json({ data: [], currentPage: page, totalPages: 0 });
-        }
-
-        const idsQuery = `SELECT DISTINCT p.id FROM productos p ${whereClause} LIMIT ? OFFSET ?`;
-        const [idsRows] = await pool.query(idsQuery, [...paramsCount, limit, offset]);
-        const ids = idsRows.map(r => r.id);
-
-        if (ids.length === 0) {
-            return res.json({ data: [], currentPage: page, totalPages: 0 });
-        }
+        const productIds = idRows.map(row => row.id);
 
         const queryData = `
             SELECT 
@@ -266,20 +343,19 @@ app.get('/api/productos', async (req, res) => {
             JOIN supermercados s ON pp.supermercado_id = s.id 
             WHERE p.id IN (?)
         `;
-        const [rows] = await pool.query(queryData, [ids]);
-
-        // Cargar todas las sucursales de la base de datos (siempre)
+        const [rows] = await pool.query(queryData, [productIds]);
         const [sucursales] = await pool.query("SELECT * FROM sucursales WHERE latitud IS NOT NULL AND longitud IS NOT NULL");
 
         const obtenerColores = (nombreSuper) => {
             const lower = nombreSuper.toLowerCase();
             if (lower.includes('lider')) return { bgColor: '#DBEAFE', textColor: '#1D4ED8' };
             if (lower.includes('santa')) return { bgColor: '#FEE2E2', textColor: '#B91C1C' };
+            if (lower.includes('unimarc')) return { bgColor: '#FEF3C7', textColor: '#B45309' };
+            if (lower.includes('tottus')) return { bgColor: '#DCFCE7', textColor: '#15803D' };
             return { bgColor: '#DCFCE7', textColor: '#15803D' };
         };
 
         const productosMap = {};
-        
         rows.forEach(row => {
             if (!productosMap[row.id]) {
                 let nutricionObj = null;
@@ -288,14 +364,16 @@ app.get('/api/productos', async (req, res) => {
                 }
                 productosMap[row.id] = { id: row.id, name: row.name, brand: row.brand, url_imagen: row.url_imagen, nutrition: nutricionObj, all_prices: [] };
             }
-
-            // Obtener sucursal real desde la tabla `sucursales` (con o sin userLat/userLon)
+            
+            const idxExistente = productosMap[row.id].all_prices.findIndex(p => Number(p.supermercado_id) === Number(row.supermercado_id));
             const sucInfo = obtenerSucursalDeMarca(sucursales, row.supermercado_id, userLat, userLon);
 
-            productosMap[row.id].all_prices.push({ 
+            const nuevoPrecioObj = { 
                 supermercado_id: row.supermercado_id,
                 supermarket: row.supermarket, 
                 price: row.price, 
+                precio_anterior: row.precio_anterior,
+                escaneado_en: row.escaneado_en,
                 url_producto: row.url_producto, 
                 url_logo: row.url_logo,
                 nombre_local: sucInfo ? sucInfo.nombre_local : null,
@@ -304,34 +382,48 @@ app.get('/api/productos', async (req, res) => {
                 longitud: sucInfo ? sucInfo.longitud : null,
                 distancia_str: sucInfo ? sucInfo.distancia_str : null,
                 distancia_km: sucInfo ? sucInfo.distancia_km : null
-            });
+            };
+
+            if (idxExistente === -1) {
+                productosMap[row.id].all_prices.push(nuevoPrecioObj);
+            } else if (row.price < productosMap[row.id].all_prices[idxExistente].price) {
+                productosMap[row.id].all_prices[idxExistente] = nuevoPrecioObj;
+            }
         });
 
-        const productosArray = ids.map(id => productosMap[id]).filter(Boolean);
-        
-        const productosFormateados = productosArray.map(prod => {
+        const formattedProducts = productIds.map(id => {
+            const prod = productosMap[id];
+            if (!prod || prod.all_prices.length === 0) return null;
             prod.all_prices.sort((a, b) => a.price - b.price);
             const cheapest = prod.all_prices[0];
-            const col = obtenerColores(cheapest.supermarket);
-            
+            const mainColors = obtenerColores(cheapest.supermarket);
             return {
                 id: prod.id, name: prod.name, brand: prod.brand, image_url: prod.url_imagen, nutrition: prod.nutrition,
                 supermarket: cheapest.supermarket, price: '$ ' + cheapest.price.toLocaleString('es-CL'),
-                url_logo: cheapest.url_logo, bgColor: col.bgColor, textColor: col.textColor,
+                url_logo: cheapest.url_logo, bgColor: mainColors.bgColor, textColor: mainColors.textColor,
+                escaneado_en: cheapest.escaneado_en,
                 all_prices: prod.all_prices.map(p => {
-                    const c = obtenerColores(p.supermarket);
-                    return { ...p, priceStr: '$ ' + p.price.toLocaleString('es-CL'), bgColor: c.bgColor, textColor: c.textColor };
+                    const col = obtenerColores(p.supermarket);
+                    return { 
+                        ...p,
+                        priceStr: '$ ' + p.price.toLocaleString('es-CL'), 
+                        bgColor: col.bgColor, 
+                        textColor: col.textColor
+                    };
                 })
             };
-        });
+        }).filter(Boolean);
 
-        res.json({ data: productosFormateados, currentPage: page, totalPages: totalPages });
+        res.json({ data: formattedProducts, currentPage: page, totalPages: totalPages });
     } catch (error) {
-        console.error("Error productos:", error);
+        console.error(error);
         res.status(500).json({ error: 'Error al obtener productos' });
     }
 });
 
+// ==========================================
+// RUTA: RECETAS
+// ==========================================
 app.get('/api/recetas', async (req, res) => {
     try {
         const [recetas] = await pool.query("SELECT * FROM recetas");
@@ -357,7 +449,7 @@ app.get('/api/recetas', async (req, res) => {
 });
 
 // ==========================================
-// CARRITO MULTI-LISTAS Y SUCURSALES
+// CARRITO Y SUCURSALES
 // ==========================================
 app.get('/api/mi-lista', verificarToken, async (req, res) => {
     const listaId = req.query.lista_id;
@@ -411,7 +503,6 @@ app.get('/api/mi-lista', verificarToken, async (req, res) => {
                 productosMap[prodId] = { producto_id: prodId, nombre: row.name, marca: row.brand, image_url: row.url_imagen, url_imagen: row.url_imagen, cantidad, all_prices: [] };
             }
 
-            // Obtener sucursal real de la tabla `sucursales` (siempre)
             const sucInfo = obtenerSucursalDeMarca(sucursales, row.supermercado_id, userLat, userLon);
 
             productosMap[prodId].all_prices.push({ 
@@ -558,7 +649,7 @@ app.delete('/api/mi-lista/eliminar/:producto_id', verificarToken, async (req, re
 });
 
 // ==========================================
-// RUTA: OBTENER SUCURSALES CERCANAS (MAPA GENERAL)
+// RUTA: SUCURSALES
 // ==========================================
 app.get('/api/sucursales', async (req, res) => {
     const userLat = parseFloat(req.query.lat);
@@ -619,9 +710,8 @@ app.get('/api/sucursales', async (req, res) => {
     }
 });
 
-
 // ==========================================
-// RUTA: ESCÁNER INTELIGENTE + PRODUCTOS SIMILARES
+// RUTA: ESCÁNER INTELIGENTE
 // ==========================================
 app.get('/api/escanear/:codigo', async (req, res) => {
     const codigoRaw = (req.params.codigo || '').trim();
@@ -631,7 +721,6 @@ app.get('/api/escanear/:codigo', async (req, res) => {
     const userLon = parseFloat(req.query.lon);
 
     try {
-        // 1. Buscar el producto escaneado por código exacto, sin ceros o prefijo EAN
         const [prodRows] = await pool.query(
             `SELECT id, nombre, marca, categoria, codigo_barras 
              FROM productos 
@@ -647,7 +736,6 @@ app.get('/api/escanear/:codigo', async (req, res) => {
 
         const prodBase = prodRows[0];
 
-        // 2. Buscar productos similares (ej. "Aceite Maravilla Chef" -> busca otros "Aceite Maravilla")
         const stopWords = ['de', 'el', 'la', 'los', 'las', 'en', 'con', 'para', 'por', 'sin', 'un', 'una', 'bolsa', 'botella', 'caja', 'pack', 'envase', 'formato', 'display', 'doypack', 'tira', 'sachet', 'tarro', 'lata'];
         const marcaPalabras = (prodBase.marca || '').toLowerCase().split(/\s+/).filter(Boolean);
 
@@ -657,14 +745,13 @@ app.get('/api/escanear/:codigo', async (req, res) => {
             .replace(/[^a-z\s]/g, ' ')
             .split(/\s+/)
             .filter(w => w.length >= 3 && !stopWords.includes(w) && !marcaPalabras.includes(w))
-            .slice(0, 2); // Tomamos las 2 palabras principales del producto (ej: ["aceite", "maravilla"])
+            .slice(0, 2);
 
         let idsSimilares = [];
         if (palabrasClave.length > 0) {
             let whereSim = "WHERE p.id != ?";
             let paramsSim = [prodBase.id];
 
-            // Exigimos la primera palabra clave (ej. "aceite") y priorizamos la segunda (ej. "maravilla")
             whereSim += " AND p.nombre LIKE ?";
             paramsSim.push(`%${palabrasClave[0]}%`);
 
@@ -688,7 +775,6 @@ app.get('/api/escanear/:codigo', async (req, res) => {
 
         const todosLosIds = [prodBase.id, ...idsSimilares];
 
-        // 3. Obtener precios y sucursales para el producto escaneado y sus similares
         const [rows] = await pool.query(`
             SELECT 
                 p.id, p.nombre as name, p.marca as brand, p.url_imagen, p.info_nutricional, 
@@ -776,9 +862,8 @@ app.get('/api/escanear/:codigo', async (req, res) => {
     }
 });
 
-
 // ==========================================
-// INICIALIZAR TABLAS DE NOTIFICACIONES Y AHORRO MENSUAL
+// INICIALIZAR TABLAS EXTRAS
 // ==========================================
 async function inicializarTablasExtras() {
     try {
@@ -807,6 +892,12 @@ async function inicializarTablasExtras() {
                 fecha DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
+        await pool.query(`
+            ALTER TABLE usuarios 
+            ADD COLUMN IF NOT EXISTS fcm_token TEXT,
+            ADD COLUMN IF NOT EXISTS notificaciones_activas TINYINT(1) DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS es_pro TINYINT(1) DEFAULT 0
+        `);
     } catch (e) {
         console.error("Error creando tablas extras:", e.message);
     }
@@ -814,12 +905,79 @@ async function inicializarTablasExtras() {
 inicializarTablasExtras();
 
 // ==========================================
-// RUTA: NOTIFICACIONES DE BAJADA DE PRECIO (PRODUCTOS EN LISTAS)
+// TAREA AUTOMÁTICA EN SEGUNDO PLANO (CRON)
+// ==========================================
+async function ejecutarRadarOfertas() {
+    console.log('🔍 Ejecutando radar automático de ofertas en segundo plano...');
+    try {
+        const [ofertasTop] = await pool.query(`
+            SELECT 
+                p.id, p.nombre as name, p.marca as brand, p.url_imagen, pp.precio, pp.precio_anterior, s.nombre as supermercado
+            FROM productos p
+            JOIN precios_productos pp ON p.id = pp.producto_id
+            JOIN supermercados s ON pp.supermercado_id = s.id
+            WHERE pp.precio_anterior > pp.precio 
+            AND ((pp.precio_anterior - pp.precio) / pp.precio_anterior) >= 0.15
+            ORDER BY (pp.precio_anterior - pp.precio) DESC
+            LIMIT 5
+        `);
+
+        if (ofertasTop.length === 0) return;
+
+        const [usuariosTokens] = await pool.query(`
+            SELECT id, fcm_token FROM usuarios WHERE fcm_token IS NOT NULL AND notificaciones_activas = 1
+        `);
+
+        for (var usuario of usuariosTokens) {
+            const oferta = ofertasTop[Math.floor(Math.random() * ofertasTop.length)];
+            
+            const mensajePayload = {
+                token: usuario.fcm_token,
+                notification: {
+                    title: '🔥 ¡Super Oferta Detectada!',
+                    body: `${oferta.name} bajó a $${oferta.precio} en ${oferta.supermercado}. ¡Aprovecha!`,
+                },
+                data: {
+                    producto_id: oferta.id.toString(),
+                    tipo: 'oferta_radar'
+                },
+                android: {
+                    notification: {
+                        imageUrl: oferta.url_imagen || '',
+                        sound: 'default',
+                        priority: 'high'
+                    }
+                }
+            };
+
+            try {
+                await admin.messaging().send(mensajePayload);
+                console.log(`🚀 Notificación enviada a usuario ${usuario.id}: ${oferta.name}`);
+            } catch (err) {
+                console.error(`Error enviando a usuario ${usuario.id}:`, err.message);
+            }
+        }
+    } catch (e) {
+        console.error('Error en el cron job de ofertas:', e);
+    }
+}
+
+cron.schedule('0 10,13,17 * * *', ejecutarRadarOfertas, {
+    scheduled: true,
+    timezone: "America/Santiago"
+});
+
+cron.schedule('30 19 * * *', ejecutarRadarOfertas, {
+    scheduled: true,
+    timezone: "America/Santiago"
+});
+
+// ==========================================
+// RUTAS DE NOTIFICACIONES
 // ==========================================
 app.get('/api/notificaciones', verificarToken, async (req, res) => {
     const usuario_id = req.user.id;
     try {
-        // 1. Detectar productos guardados en las listas del usuario que bajaron de precio
         const [bajadas] = await pool.query(`
             SELECT DISTINCT
                 f.producto_id,
@@ -844,7 +1002,6 @@ app.get('/api/notificaciones', verificarToken, async (req, res) => {
             `, [usuario_id, b.producto_id, b.supermercado, b.precio_ant, b.precio_nuevo]);
         }
 
-        // 2. Devolver el historial de notificaciones con la foto y datos del producto
         const [notifs] = await pool.query(`
             SELECT 
                 n.id, n.producto_id, n.supermercado, n.precio_anterior, n.precio_nuevo, 
@@ -875,7 +1032,7 @@ app.put('/api/notificaciones/leer', verificarToken, async (req, res) => {
 });
 
 // ==========================================
-// RUTA: REGISTRAR LISTA COMPRADA Y CALCULAR AHORRO DEL MES EN CURSO
+// REGISTRO DE COMPRAS Y PERFIL
 // ==========================================
 app.post('/api/compras/registrar', verificarToken, async (req, res) => {
     const usuario_id = req.user.id;
@@ -894,30 +1051,176 @@ app.post('/api/compras/registrar', verificarToken, async (req, res) => {
 app.get('/api/perfil/resumen-mes', verificarToken, async (req, res) => {
     const usuario_id = req.user.id;
     try {
-        const [ahorroRows] = await pool.query(`
-            SELECT 
-                COALESCE(SUM(ahorro_logrado), 0) AS ahorro_mes,
-                COALESCE(SUM(total_pagado), 0) AS gastado_mes,
-                COUNT(id) AS compras_mes
-            FROM historial_compras_usuario
-            WHERE usuario_id = ?
-              AND MONTH(fecha) = MONTH(CURDATE())
-              AND YEAR(fecha) = YEAR(CURDATE())
-        `, [usuario_id]);
-
-        const [listasRows] = await pool.query(
-            "SELECT COUNT(id) AS total_listas FROM listas_compras WHERE usuario_id = ?",
-            [usuario_id]
-        );
+        const [ahorroRows] = await pool.query(`SELECT COALESCE(SUM(ahorro_logrado), 0) AS ahorro_mes, COALESCE(SUM(total_pagado), 0) AS gastado_mes, COUNT(id) AS compras_mes FROM historial_compras_usuario WHERE usuario_id = ? AND MONTH(fecha) = MONTH(CURDATE()) AND YEAR(fecha) = YEAR(CURDATE())`, [usuario_id]);
+        const [listasRows] = await pool.query("SELECT COUNT(id) AS total_listas FROM listas_compras WHERE usuario_id = ?", [usuario_id]);
+        const [userRows] = await pool.query("SELECT es_pro FROM usuarios WHERE id = ?", [usuario_id]); // NUEVO
 
         res.json({
             ahorro_mes: Number(ahorroRows[0].ahorro_mes || 0),
             gastado_mes: Number(ahorroRows[0].gastado_mes || 0),
             compras_mes: Number(ahorroRows[0].compras_mes || 0),
-            total_listas: Number(listasRows[0].total_listas || 0)
+            total_listas: Number(listasRows[0].total_listas || 0),
+            es_pro: userRows.length > 0 ? (userRows[0].es_pro === 1) : false // NUEVO
         });
     } catch (error) {
         res.status(500).json({ error: 'Error al obtener resumen mensual' });
+    }
+});
+
+
+// ==========================================
+// MÓDULO DE PAGOS Y SUSCRIPCIONES (MERCADO PAGO)
+// ==========================================
+const { MercadoPagoConfig, PreApproval } = require('mercadopago');
+
+const MP_TOKEN = process.env.MP_ACCESS_TOKEN || 'APP_USR-4666261307030308-111114-027741ea48875d652c922aa5ea1e0b34-3462407532';
+const client = new MercadoPagoConfig({ accessToken: MP_TOKEN });
+
+// Asegurar que la tabla suscripciones exista
+pool.query(`
+    CREATE TABLE IF NOT EXISTS suscripciones (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        usuario_id INT NOT NULL,
+        transaccion_id VARCHAR(100),
+        monto INT DEFAULT 2990,
+        estado VARCHAR(50),
+        fecha_expiracion DATETIME,
+        creado_en DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+`).catch(err => console.error('Error tabla suscripciones:', err.message));
+
+// Función auxiliar para activar el PRO en BD
+async function activarUsuarioPro(usuarioId, transaccionId, monto = 2990) {
+    if (!usuarioId) return;
+    const fechaExpiracion = new Date();
+    fechaExpiracion.setDate(fechaExpiracion.getDate() + 30);
+
+    await pool.query(`UPDATE usuarios SET es_pro = 1 WHERE id = ?`, [usuarioId]);
+    await pool.query(
+        `INSERT INTO suscripciones (usuario_id, transaccion_id, monto, estado, fecha_expiracion) VALUES (?, ?, ?, 'activo', ?)`,
+        [usuarioId, transaccionId.toString(), Number(monto) || 2990, fechaExpiracion]
+    );
+    console.log(`👑 Usuario ID ${usuarioId} actualizado a PRO exitosamente.`);
+}
+
+// 1. Endpoint para crear Suscripción con 7 DÍAS GRATIS
+app.post('/api/crear-suscripcion', verificarToken, async (req, res) => {
+    try {
+        const usuario_id = req.user.id;
+        const emailOriginal = req.user.email;
+        const { plan_nombre, precio } = req.body;
+
+        const emailPagador = (emailOriginal === 'jonypinilla.12@gmail.com' || emailOriginal === 'jonycruzado.12@gmail.com') 
+            ? 'test_user_1008424578@testuser.com' 
+            : emailOriginal;
+
+        const preApproval = new PreApproval(client);
+        const result = await preApproval.create({
+            body: {
+                reason: plan_nombre || 'Ahorrapp Pro - Suscripción Mensual (7 Días Gratis)',
+                auto_recurring: {
+                    frequency: 1,
+                    frequency_type: 'months',
+                    transaction_amount: Number(precio) || 2990,
+                    currency_id: 'CLP',
+                    free_trial: {
+                        frequency: 7,
+                        frequency_type: 'days'
+                    }
+                },
+                back_url: 'https://api.opinox.cl/api/suscripcion-exitosa',
+                notification_url: 'https://api.opinox.cl/api/webhook/mercadopago',
+                payer_email: emailPagador,
+                external_reference: usuario_id.toString()
+            }
+        });
+
+        res.json({ success: true, init_point: result.init_point });
+
+    } catch (error) {
+        console.error('Error MP:', error);
+        res.status(500).json({ success: false, error: 'No se pudo iniciar la suscripción' });
+    }
+});
+
+// 1.5 Ruta de retorno cuando el usuario termina de pagar en el navegador
+app.get('/api/suscripcion-exitosa', async (req, res) => {
+    const preapprovalId = req.query.preapproval_id;
+    if (preapprovalId) {
+        try {
+            const response = await fetch(`https://api.mercadopago.com/preapproval/${preapprovalId}`, {
+                headers: { 'Authorization': `Bearer ${MP_TOKEN}` }
+            });
+            const subData = await response.json();
+            if (subData.status === 'authorized' && subData.external_reference) {
+                await activarUsuarioPro(subData.external_reference, subData.id, subData.auto_recurring?.transaction_amount);
+            }
+        } catch (e) {
+            console.error('Error verificando retorno MP:', e);
+        }
+    }
+    res.send(`
+        <html>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 60px; background: #1E1B4B; color: white;">
+                <h1>👑 ¡Suscripción PRO Activada!</h1>
+                <p>Ya puedes cerrar esta ventana y volver a la aplicación Ahorrapp.</p>
+            </body>
+        </html>
+    `);
+});
+
+// 2. Endpoint para Cancelar Suscripción (Mantiene el mes activo)
+app.put('/api/cancelar-suscripcion', verificarToken, async (req, res) => {
+    try {
+        const usuario_id = req.user.id;
+        await pool.query("UPDATE suscripciones SET estado = 'cancelada_pendiente_expirar' WHERE usuario_id = ?", [usuario_id]);
+        res.json({ success: true, mensaje: 'Suscripción cancelada. Seguirás siendo PRO hasta que termine tu ciclo actual.' });
+    } catch (error) {
+        res.status(500).json({ error: 'Error al cancelar' });
+    }
+});
+
+// 3. Webhook de Mercado Pago (Soporta Suscripciones con 7 días gratis y Pagos directos)
+app.post('/api/webhook/mercadopago', async (req, res) => {
+    try {
+        const eventData = req.body;
+        const type = eventData.type || req.query.type || req.query.topic;
+        const dataId = eventData.data?.id || req.query['data.id'] || req.query.id;
+
+        console.log('🔔 Webhook MP recibido:', { type, action: eventData.action, dataId });
+
+        // CASO A: Suscripción (PreApproval) autorizada (activa los 7 días gratis de inmediato)
+        if (type === 'subscription_preapproval' || type === 'preapproval' || (eventData.action && eventData.action.includes('preapproval'))) {
+            if (dataId) {
+                const response = await fetch(`https://api.mercadopago.com/preapproval/${dataId}`, {
+                    headers: { 'Authorization': `Bearer ${MP_TOKEN}` }
+                });
+                const subData = await response.json();
+
+                if (subData.status === 'authorized') {
+                    await activarUsuarioPro(subData.external_reference, subData.id, subData.auto_recurring?.transaction_amount);
+                }
+            }
+        }
+
+        // CASO B: Cobro de pago normal aprobado
+        if (type === 'payment' || eventData.action === 'payment.created') {
+            if (dataId) {
+                const response = await fetch(`https://api.mercadopago.com/v1/payments/${dataId}`, {
+                    headers: { 'Authorization': `Bearer ${MP_TOKEN}` }
+                });
+                const pagoData = await response.json();
+
+                if (pagoData.status === 'approved') {
+                    await activarUsuarioPro(pagoData.external_reference, pagoData.id, pagoData.transaction_amount);
+                }
+            }
+        }
+
+        res.status(200).send('OK');
+    } catch (error) {
+        console.error('Error en Webhook MP:', error);
+        res.status(500).send('Error interno');
     }
 });
 
