@@ -79,6 +79,49 @@ function normalizarEAN13(codigo) {
     return limpio;
 }
 
+async function resolverDesafioLider(page) {
+    let titulo = await page.title();
+    if (!titulo.toLowerCase().includes('robot') && !titulo.toLowerCase().includes('human')) {
+        return true;
+    }
+
+    console.log('🛡️ Desafío "Robot or human?" detectado. Ejecutando Press & Hold sobre #px-captcha...');
+
+    for (let intento = 1; intento <= 3; intento++) {
+        try {
+            const handle = await page.$('#px-captcha iframe, #px-captcha');
+            let x = 683;
+            let y = 380;
+
+            if (handle) {
+                const box = await handle.boundingBox();
+                if (box && box.width > 0 && box.height > 0) {
+                    x = box.x + box.width / 2;
+                    y = box.y + box.height / 2;
+                }
+            }
+
+            await page.mouse.move(x - 100, y - 50, { steps: 15 });
+            await page.mouse.move(x, y, { steps: 20 });
+            await page.mouse.down();
+            await new Promise(r => setTimeout(r, 9500));
+            await page.mouse.up();
+
+            await new Promise(r => setTimeout(r, 5000));
+            titulo = await page.title();
+            console.log(`🔄 Título tras Press & Hold (Intento ${intento}): "${titulo}"`);
+
+            if (!titulo.toLowerCase().includes('robot') && !titulo.toLowerCase().includes('human')) {
+                console.log('✅ Desafío superado exitosamente.');
+                return true;
+            }
+        } catch (err) {
+            console.log('⚠️ Error durante intento de desbloqueo:', err.message);
+        }
+    }
+    return false;
+}
+
 async function explorarLider() {
     try {
         console.log('1. Verificando supermercado Lider en la base de datos...');
@@ -97,7 +140,7 @@ async function explorarLider() {
 
         console.log('2. Iniciando navegador Puppeteer (Modo Ventana Real con Xvfb)...');
         const browser = await puppeteer.launch({ 
-            headless: false, // Con xvfb-run en GitHub Actions abre ventana real sin ser detectado como HeadlessChrome
+            headless: false,
             defaultViewport: { width: 1366, height: 768 },
             args: [
                 '--window-size=1366,768',
@@ -110,9 +153,9 @@ async function explorarLider() {
         });
         const page = await browser.newPage();
 
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-        );
+        const uaOriginal = await browser.userAgent();
+        await page.setUserAgent(uaOriginal.replace('HeadlessChrome/', 'Chrome/'));
+
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
             'Upgrade-Insecure-Requests': '1'
@@ -124,7 +167,6 @@ async function explorarLider() {
         await page.evaluateOnNewDocument(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             Object.defineProperty(navigator, 'languages', { get: () => ['es-CL', 'es'] });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         });
 
         let totalNuevosGlobal = 0;
@@ -138,13 +180,20 @@ async function explorarLider() {
                 const urlActual = `${urlCategoria}?page=${numPagina}`;
                 console.log(`➡️ PÁGINA ${numPagina}: ${urlActual}`);
                 
-                await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 }); 
                 try {
-                    await page.waitForSelector('div[role="group"], [data-automation-id="product-title"], #__NEXT_DATA__', { timeout: 12000 });
-                } catch (_) {}
+                    await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                } catch (e) {
+                    console.log('⚠️ Timeout de carga inicial controlado, continuando...');
+                }
 
                 console.log('Esperando a que cargue...');
                 await new Promise(resolve => setTimeout(resolve, 4500));
+
+                await resolverDesafioLider(page);
+
+                try {
+                    await page.waitForSelector('div[role="group"], [data-automation-id="product-title"], #__NEXT_DATA__', { timeout: 10000 });
+                } catch (_) {}
 
                 const tituloCargado = await page.title();
                 console.log(`📄 Título en Lider: "${tituloCargado}"`);
@@ -172,7 +221,7 @@ async function explorarLider() {
                     const resultados = [];
                     const nombresVistos = new Set();
 
-                    // MÉTODO 1: Extraer desde __NEXT_DATA__ (JSON interno de Walmart/Lider)
+                    // MÉTODO 1: Extraer desde __NEXT_DATA__
                     try {
                         const nextEl = document.getElementById('__NEXT_DATA__');
                         if (nextEl) {
