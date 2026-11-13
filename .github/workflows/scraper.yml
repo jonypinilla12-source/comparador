@@ -34,10 +34,6 @@ jobs:
           npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
           npx puppeteer browsers install chrome
 
-      - name: Ejecutar Scraper Tottus (Con Monitor Virtual Xvfb)
-        continue-on-error: true
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperTottus.js
-
       - name: Ejecutar Scraper Lider (Con Monitor Virtual Xvfb)
         continue-on-error: true
         run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperLider.js
@@ -53,3 +49,7 @@ jobs:
       - name: Ejecutar Scraper Unimarc
         continue-on-error: true
         run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperUnimarc.js
+
+      - name: Ejecutar Scraper Tottus (Con Monitor Virtual Xvfb)
+        continue-on-error: true
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperTottus.js
