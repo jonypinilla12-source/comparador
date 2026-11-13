@@ -60,6 +60,11 @@ const urlsLider = [
     'https://super.lider.cl/browse/limpieza-y-aseo/insecticidas-y-control-de-plagas/43390617_74938748'
 ];
 
+const MAX_REINTENTOS_PAGINA = 3;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const aleatorio = (min, max) => min + Math.floor(Math.random() * (max - min));
+
 function normalizarEAN13(codigo) {
     if (!codigo) return null;
     let limpio = codigo.toString().trim().replace(/^0+/, '');
@@ -79,11 +84,19 @@ function normalizarEAN13(codigo) {
     return limpio;
 }
 
-async function resolverDesafioLider(page) {
-    let titulo = await page.title();
-    if (!titulo.toLowerCase().includes('robot') && !titulo.toLowerCase().includes('human')) {
-        return true;
+async function estaBloqueada(page) {
+    try {
+        const titulo = (await page.title()).toLowerCase();
+        return titulo.includes('robot') || titulo.includes('human');
+    } catch (_) {
+        return false;
     }
+}
+
+// Resuelve el desafío "Robot or human?" (Press & Hold de PerimeterX).
+// Devuelve true si la página quedó libre, false si sigue bloqueada.
+async function resolverDesafioLider(page) {
+    if (!(await estaBloqueada(page))) return true;
 
     console.log('🛡️ Desafío "Robot or human?" detectado. Ejecutando Press & Hold sobre #px-captcha...');
 
@@ -101,17 +114,21 @@ async function resolverDesafioLider(page) {
                 }
             }
 
-            await page.mouse.move(x - 100, y - 50, { steps: 15 });
-            await page.mouse.move(x, y, { steps: 20 });
+            // Movimiento más "humano": trayectoria con ruido y pausas variables
+            await page.mouse.move(x - 200 + Math.random() * 50, y - 100 + Math.random() * 50, { steps: 20 });
+            await sleep(aleatorio(400, 1000));
+            await page.mouse.move(x + Math.random() * 4, y + Math.random() * 4, { steps: 25 });
+            await sleep(aleatorio(150, 400));
+
             await page.mouse.down();
-            await new Promise(r => setTimeout(r, 9500));
+            await sleep(aleatorio(8000, 11000));
             await page.mouse.up();
 
-            await new Promise(r => setTimeout(r, 5000));
-            titulo = await page.title();
+            await sleep(5000);
+            const titulo = await page.title();
             console.log(`🔄 Título tras Press & Hold (Intento ${intento}): "${titulo}"`);
 
-            if (!titulo.toLowerCase().includes('robot') && !titulo.toLowerCase().includes('human')) {
+            if (!(await estaBloqueada(page))) {
                 console.log('✅ Desafío superado exitosamente.');
                 return true;
             }
@@ -123,11 +140,13 @@ async function resolverDesafioLider(page) {
 }
 
 async function explorarLider() {
+    const paginasFallidas = [];
+
     try {
         console.log('1. Verificando supermercado Lider en la base de datos...');
         let supermercadoId;
         const [supermercados] = await pool.query("SELECT id FROM supermercados WHERE LOWER(nombre) = 'lider'");
-        
+
         if (supermercados.length > 0) {
             supermercadoId = supermercados[0].id;
         } else {
@@ -139,7 +158,7 @@ async function explorarLider() {
         }
 
         console.log('2. Iniciando navegador Puppeteer (Modo Ventana Real con Xvfb)...');
-        const browser = await puppeteer.launch({ 
+        const browser = await puppeteer.launch({
             headless: false,
             defaultViewport: { width: 1366, height: 768 },
             args: [
@@ -175,11 +194,11 @@ async function explorarLider() {
         for (const urlCategoria of urlsLider) {
             console.log(`\n======================================================`);
             console.log(`🚀 INICIANDO CATEGORÍA: ${urlCategoria}`);
-            
+
             for (let numPagina = 1; numPagina <= 50; numPagina++) {
                 const urlActual = `${urlCategoria}?page=${numPagina}`;
                 console.log(`➡️ PÁGINA ${numPagina}: ${urlActual}`);
-                
+
                 try {
                     await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 } catch (e) {
@@ -187,9 +206,29 @@ async function explorarLider() {
                 }
 
                 console.log('Esperando a que cargue...');
-                await new Promise(resolve => setTimeout(resolve, 4500));
+                await sleep(4500);
 
-                await resolverDesafioLider(page);
+                let desbloqueada = await resolverDesafioLider(page);
+
+                // Si sigue bloqueada, esperar y recargar la misma página
+                let reintentos = 0;
+                while (!desbloqueada && reintentos < MAX_REINTENTOS_PAGINA) {
+                    reintentos++;
+                    const espera = aleatorio(20000, 40000);
+                    console.log(`⏳ Bloqueado. Esperando ${Math.round(espera / 1000)}s y reintentando página (${reintentos}/${MAX_REINTENTOS_PAGINA})...`);
+                    await sleep(espera);
+                    try {
+                        await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                    } catch (e) {}
+                    await sleep(4500);
+                    desbloqueada = await resolverDesafioLider(page);
+                }
+
+                if (!desbloqueada) {
+                    console.log('🚫 No se pudo superar el bloqueo en esta página. Pasando a la siguiente categoría SIN marcarla como terminada.');
+                    paginasFallidas.push(urlActual);
+                    break;
+                }
 
                 try {
                     await page.waitForSelector('div[role="group"], [data-automation-id="product-title"], #__NEXT_DATA__', { timeout: 10000 });
@@ -202,7 +241,7 @@ async function explorarLider() {
                 await page.evaluate(async () => {
                     await new Promise((resolve) => {
                         let totalHeight = 0;
-                        let distance = 200; 
+                        let distance = 200;
                         let steps = 0;
                         let timer = setInterval(() => {
                             let scrollHeight = document.body ? document.body.scrollHeight : 0;
@@ -267,15 +306,15 @@ async function explorarLider() {
                         const precioEl = caja.querySelector('[data-automation-id="product-price"]');
                         const enlaceEl = caja.querySelector('a[href*="/ip/"]');
                         const imgEl = caja.querySelector('img[data-testid="productTileImage"], img');
-                        
+
                         if (tituloEl && precioEl && enlaceEl) {
                             const nombre = tituloEl.innerText.trim();
                             if (!nombre || nombresVistos.has(nombre.toLowerCase())) return;
-                            
+
                             let marca = 'Sin marca';
                             const marcaEl = caja.querySelector('div.mb1.mt2.b.f6.black');
                             if (marcaEl) marca = marcaEl.innerText.trim();
-                            
+
                             const urlParcial = enlaceEl.getAttribute('href');
                             const url_producto = urlParcial.startsWith('http') ? urlParcial : `https://super.lider.cl${urlParcial}`;
                             const url_imagen = imgEl ? imgEl.getAttribute('src') : null;
@@ -285,14 +324,14 @@ async function explorarLider() {
                             if (matchUrl && matchUrl[1] && matchUrl[1].length >= 12) {
                                 codigo_barras = matchUrl[1];
                             }
-                            
+
                             const precioTexto = precioEl.innerText;
                             let precio = 0;
                             const matchPrecio = precioTexto.match(/\$\s?([\d\.]+)/);
                             if (matchPrecio) {
                                 precio = parseInt(matchPrecio[1].replace(/\./g, ''), 10) || 0;
                             }
-                            
+
                             if (precio > 0) {
                                 nombresVistos.add(nombre.toLowerCase());
                                 resultados.push({ nombre, marca, precio, url_producto, url_imagen, codigo_barras });
@@ -305,8 +344,14 @@ async function explorarLider() {
                 console.log(`¡Se extrajeron ${productosExtraidos.length} productos de esta página!`);
 
                 if (productosExtraidos.length === 0) {
-                    console.log('⚠️ No hay más productos. Saltando a la siguiente categoría...');
-                    break; 
+                    // Distinguir fin real de categoría vs. bloqueo tardío
+                    if (await estaBloqueada(page)) {
+                        console.log('🚫 La página quedó bloqueada durante la extracción. Se registra como fallida.');
+                        paginasFallidas.push(urlActual);
+                    } else {
+                        console.log('⚠️ No hay más productos. Saltando a la siguiente categoría...');
+                    }
+                    break;
                 }
 
                 console.log('Guardando en MySQL...');
@@ -315,19 +360,19 @@ async function explorarLider() {
 
                 for (const prod of productosExtraidos) {
                     let productoId;
-                    
+
                     if (prod.codigo_barras) {
                         prod.codigo_barras = normalizarEAN13(prod.codigo_barras);
                     }
-                    
+
                     const [existente] = await pool.query(
                         `SELECT id FROM productos 
                          WHERE (codigo_barras = ? AND codigo_barras IS NOT NULL) 
                             OR (LOWER(nombre) = LOWER(?) AND LOWER(marca) = LOWER(?)) 
-                         LIMIT 1`, 
+                         LIMIT 1`,
                         [prod.codigo_barras, prod.nombre, prod.marca]
                     );
-                    
+
                     if (existente.length > 0) {
                         productoId = existente[0].id;
                         await pool.query(
@@ -338,7 +383,7 @@ async function explorarLider() {
                         totalExistentesGlobal++;
                     } else {
                         const [nuevoProd] = await pool.query(
-                            "INSERT INTO productos (nombre, marca, url_imagen, codigo_barras) VALUES (?, ?, ?, ?)", 
+                            "INSERT INTO productos (nombre, marca, url_imagen, codigo_barras) VALUES (?, ?, ?, ?)",
                             [prod.nombre, prod.marca, prod.url_imagen, prod.codigo_barras]
                         );
                         productoId = nuevoProd.insertId;
@@ -359,7 +404,7 @@ async function explorarLider() {
                             ? ultimoPrecio.fecha_scan.toISOString().split('T')[0]
                             : String(ultimoPrecio.fecha_scan).split('T')[0];
                         const esMismoDia = fechaScanStr === new Date().toISOString().split('T')[0];
-                        
+
                         if (esMismoDia && Number(ultimoPrecio.precio) === Number(prod.precio)) {
                             necesitaActualizarPrecio = false;
                         } else if (!esMismoDia) {
@@ -398,9 +443,9 @@ async function explorarLider() {
                         );
                     }
                 }
-                
+
                 console.log(`✅ Página procesada: ${nuevosPagina} productos nuevos agregados | ${existentesPagina} ya existían (se revisó el precio).`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                await sleep(aleatorio(5000, 12000));
             }
         }
 
@@ -409,13 +454,21 @@ async function explorarLider() {
         console.log(`📊 RESUMEN FINAL:`);
         console.log(`   - Nuevos productos creados: ${totalNuevosGlobal}`);
         console.log(`   - Productos ya existentes verificados: ${totalExistentesGlobal}`);
+        if (paginasFallidas.length > 0) {
+            console.log(`\n⚠️ Páginas bloqueadas que quedaron pendientes (${paginasFallidas.length}):`);
+            paginasFallidas.forEach(u => console.log('   - ' + u));
+        }
         console.log('======================================================\n');
-        
+
         await browser.close();
         process.exit(0);
 
     } catch (error) {
         console.error('❌ Error durante el scraping de Lider:', error);
+        if (paginasFallidas.length > 0) {
+            console.log('⚠️ Páginas bloqueadas antes del error:');
+            paginasFallidas.forEach(u => console.log('   - ' + u));
+        }
         process.exit(1);
     }
 }
