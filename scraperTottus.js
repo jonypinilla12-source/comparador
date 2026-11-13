@@ -19,7 +19,7 @@ const urlsTottus = [
     'https://www.tottus.cl/tottus-cl/lista/CATG27084/Cuidado-Personal'
 ];
 
-// Normaliza nombres para cruzar mejor ("Arroz Grado 1 1 Kg" === "Arroz Grado 1 1kg")
+// 1. Normalización exacta mejorada (limpia grados, GL, envases y estandariza unidades)
 function normalizarTextoCruce(texto) {
     if (!texto) return '';
     return texto
@@ -27,11 +27,127 @@ function normalizarTextoCruce(texto) {
         .toLowerCase()
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
-        .replace(/(\d+)\s*(g|gr|grs|gramos)\b/g, '$1g')
-        .replace(/(\d+)\s*(kg|kilos|kilo)\b/g, '$1kg')
-        .replace(/(\d+)\s*(ml|cc)\b/g, '$1ml')
-        .replace(/(\d+)\s*(l|lt|lts|litro|litros)\b/g, '$1l')
+        // Eliminar "gl" o "grados" pegados a los grados de alcohol (ej: "40º gl" -> "40")
+        .replace(/(\d+)\s*[°º]?\s*(gl|grados|grado)\b/g, '$1')
+        .replace(/[°º]/g, '')
+        // Estandarizar unidades (1000 ml -> 1l, 1000 g -> 1kg)
+        .replace(/\b1000\s*(ml|cc)\b/g, '1l')
+        .replace(/\b1000\s*(g|gr|grs|gramos)\b/g, '1kg')
+        .replace(/(\d+[.,]?\d*)\s*(g|gr|grs|gramos)\b/g, '$1g')
+        .replace(/(\d+[.,]?\d*)\s*(kg|kilos|kilo)\b/g, '$1kg')
+        .replace(/(\d+[.,]?\d*)\s*(ml|cc)\b/g, '$1ml')
+        .replace(/(\d+[.,]?\d*)\s*(l|lt|lts|litro|litros)\b/g, '$1l')
+        .replace(/(\d+)\s*(un|und|unidades|unidad)\b/g, '$1un')
         .replace(/[^a-z0-9]/g, '');
+}
+
+// 2. Extrae la medida principal del producto (ej: "1000ml", "750ml", "500g") para no mezclar tamaños distintos
+function extraerMedida(texto) {
+    if (!texto) return null;
+    const limpio = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(',', '.');
+    const match = limpio.match(/\b(\d+(?:\.\d+)?)\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos|un|und|unidades)\b/);
+    if (!match) return null;
+    
+    let valor = parseFloat(match[1]);
+    let unidad = match[2];
+
+    // Convertir todo a una unidad base para comparar con exactitud (ml o g)
+    if (['l', 'lt', 'lts', 'litro', 'litros'].includes(unidad)) {
+        valor = Math.round(valor * 1000);
+        unidad = 'ml';
+    } else if (unidad === 'cc') {
+        unidad = 'ml';
+    } else if (['kg', 'kilo', 'kilos'].includes(unidad)) {
+        valor = Math.round(valor * 1000);
+        unidad = 'g';
+    } else if (['gr', 'grs', 'gramos'].includes(unidad)) {
+        unidad = 'g';
+    } else if (['und', 'unidades'].includes(unidad)) {
+        unidad = 'un';
+    }
+    return `${valor}${unidad}`;
+}
+
+// 3. Convierte el nombre en una lista de palabras clave limpias (sin conectores ni medidas)
+function obtenerTokensClave(nombre, marca = '') {
+    const stopWords = new Set([
+        'de', 'el', 'la', 'los', 'las', 'en', 'con', 'para', 'por', 'sin', 'del', 'al', 'un', 'una',
+        'gl', 'grados', 'grado', 'botella', 'envase', 'bolsa', 'caja', 'pack', 'display', 'formato',
+        'unidades', 'unidad', 'un', 'und', 'tottus', 'marca'
+    ]);
+
+    const textoCompleto = `${nombre} ${marca}`
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/(\d+)\s*[°º]?\s*(gl|grados|grado)\b/g, '$1')
+        .replace(/[°º]/g, ' ')
+        // Quitamos las medidas de los tokens porque ya las validamos con extraerMedida()
+        .replace(/\b\d+(?:[.,]\d+)?\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos|un|und|unidades)\b/g, ' ')
+        .replace(/[^a-z0-9\s]/g, ' ');
+
+    return [...new Set(
+        textoCompleto
+            .split(/\s+/)
+            .filter(w => w.length >= 2 && !stopWords.has(w))
+    )];
+}
+
+// 4. Buscador por similitud inteligente cuando falla el cruce exacto
+function buscarProductoPorSimilitud(prodTottus, listaCatalogoProcesado) {
+    const tokensTottus = obtenerTokensClave(prodTottus.nombre, prodTottus.marca);
+    if (tokensTottus.length === 0) return null;
+
+    const medidaTottus = extraerMedida(prodTottus.nombre);
+    const marcaTottus = normalizarTextoCruce(prodTottus.marca);
+
+    let mejorId = null;
+    let mejorPuntaje = 0;
+
+    for (const itemBD of listaCatalogoProcesado) {
+        // Regla A: Si AMBOS productos tienen medida explícita (ej: 1L vs 750ml) y son distintas, descartar de inmediato
+        if (medidaTottus && itemBD.medida && medidaTottus !== itemBD.medida) {
+            continue;
+        }
+
+        // Regla B: Contar cuántas palabras clave comparten (ej: ['whisky', 'white', 'horse', '40'])
+        let coincidencias = 0;
+        for (const t of tokensTottus) {
+            if (itemBD.tokens.includes(t)) {
+                coincidencias++;
+            }
+        }
+
+        if (coincidencias === 0) continue;
+
+        // Calculamos porcentaje de similitud sobre el producto que tenga menos palabras descriptivas
+        const minTokens = Math.min(tokensTottus.length, itemBD.tokens.length);
+        const maxTokens = Math.max(tokensTottus.length, itemBD.tokens.length);
+        
+        let puntaje = coincidencias / minTokens;
+
+        // Penalizar levemente si uno tiene muchas más palabras que el otro
+        const ratioLongitud = minTokens / maxTokens;
+        puntaje = (puntaje * 0.75) + (ratioLongitud * 0.25);
+
+        // Bonus si la marca coincide o está contenida
+        if (marcaTottus && itemBD.marcaNorm && (marcaTottus === itemBD.marcaNorm || itemBD.nombreNorm.includes(marcaTottus))) {
+            puntaje += 0.1;
+        }
+
+        // Bonus si ambos tienen exactamente la misma medida (ej: ambos dicen 1000ml)
+        if (medidaTottus && itemBD.medida && medidaTottus === itemBD.medida) {
+            puntaje += 0.1;
+        }
+
+        // Exigimos al menos 2 palabras clave en común y un puntaje >= 0.80 para asegurar que sea el mismo producto
+        if (coincidencias >= 2 && puntaje >= 0.80 && puntaje > mejorPuntaje) {
+            mejorPuntaje = puntaje;
+            mejorId = itemBD.id;
+        }
+    }
+
+    return mejorId;
 }
 
 async function explorarTottus() {
@@ -65,6 +181,7 @@ async function explorarTottus() {
         console.log('2. Cargando catálogo actual de productos para cruce inteligente...');
         const [catalogoActual] = await pool.query("SELECT id, nombre, marca FROM productos");
         const mapaCatalogo = new Map();
+        const catalogoProcesado = [];
 
         for (const item of catalogoActual) {
             const claveSoloNombre = normalizarTextoCruce(item.nombre);
@@ -74,6 +191,15 @@ async function explorarTottus() {
             if (claveSoloNombre) mapaCatalogo.set(claveSoloNombre, item.id);
             if (claveNombreMarca) mapaCatalogo.set(claveNombreMarca, item.id);
             if (claveMarcaNombre) mapaCatalogo.set(claveMarcaNombre, item.id);
+
+            catalogoProcesado.push({
+                id: item.id,
+                nombreOriginal: item.nombre,
+                nombreNorm: claveSoloNombre,
+                marcaNorm: normalizarTextoCruce(item.marca || ''),
+                medida: extraerMedida(item.nombre),
+                tokens: obtenerTokensClave(item.nombre, item.marca || '')
+            });
         }
         console.log(`📦 ${catalogoActual.length} productos base listos para cruzar.`);
 
@@ -205,7 +331,7 @@ async function explorarTottus() {
                 });
                 await new Promise(resolve => setTimeout(resolve, 2500));
 
-                // Extracción limpia basada exclusivamente en __NEXT_DATA__ para evitar el texto basura ("word word...")
+                // Extracción limpia basada exclusivamente en __NEXT_DATA__
                 const productosDOM = await page.evaluate(() => {
                     const resultados = [];
                     const urlsVistas = new Set();
@@ -270,7 +396,7 @@ async function explorarTottus() {
                     break;
                 }
 
-                console.log('Cruzando con la base de datos (Solo productos existentes)...');
+                console.log('Cruzando con la base de datos (Exacto + Similitud Inteligente)...');
                 let actualizadosPagina = 0;
                 let omitidosPagina = 0;
 
@@ -293,6 +419,11 @@ async function explorarTottus() {
                         const clave3 = normalizarTextoCruce(`${prod.marca} ${prod.nombre}`);
 
                         productoId = mapaCatalogo.get(clave1) || mapaCatalogo.get(clave2) || mapaCatalogo.get(clave3) || null;
+
+                        // Si no cruzó exacto, usamos el cruce inteligente por similitud de palabras y medidas
+                        if (!productoId) {
+                            productoId = buscarProductoPorSimilitud(prod, catalogoProcesado);
+                        }
                     }
 
                     if (!productoId) {
