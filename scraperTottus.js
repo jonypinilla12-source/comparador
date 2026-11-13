@@ -19,7 +19,7 @@ const urlsTottus = [
     'https://www.tottus.cl/tottus-cl/lista/CATG27084/Cuidado-Personal'
 ];
 
-// 1. Normalización exacta mejorada (limpia grados, GL, envases y estandariza unidades)
+// 1. Normalización exacta mejorada (limpia grados, GL, formatos de pack y estandariza unidades)
 function normalizarTextoCruce(texto) {
     if (!texto) return '';
     return texto
@@ -27,10 +27,10 @@ function normalizarTextoCruce(texto) {
         .toLowerCase()
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
-        // Eliminar "gl" o "grados" pegados a los grados de alcohol (ej: "40º gl" -> "40")
+        // Estandarizar "6 x 200 g" o "6 un 200 g"
+        .replace(/\b(\d+)\s*x\s*(\d+)/g, '$1un$2')
         .replace(/(\d+)\s*[°º]?\s*(gl|grados|grado)\b/g, '$1')
         .replace(/[°º]/g, '')
-        // Estandarizar unidades (1000 ml -> 1l, 1000 g -> 1kg)
         .replace(/\b1000\s*(ml|cc)\b/g, '1l')
         .replace(/\b1000\s*(g|gr|grs|gramos)\b/g, '1kg')
         .replace(/(\d+[.,]?\d*)\s*(g|gr|grs|gramos)\b/g, '$1g')
@@ -41,56 +41,84 @@ function normalizarTextoCruce(texto) {
         .replace(/[^a-z0-9]/g, '');
 }
 
-// 2. Extrae la medida principal del producto (ej: "1000ml", "750ml", "500g") para no mezclar tamaños distintos
-function extraerMedida(texto) {
-    if (!texto) return null;
+// 2. Extrae por separado el peso/volumen ("200g", "1000ml") y la cantidad de unidades del pack (ej: "6 x 200g" o "Pack 6 Un")
+function extraerInfoMedidas(texto) {
+    if (!texto) return { pesoVolumen: null, unidadesPack: null };
     const limpio = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(',', '.');
-    const match = limpio.match(/\b(\d+(?:\.\d+)?)\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos|un|und|unidades)\b/);
-    if (!match) return null;
-    
-    let valor = parseFloat(match[1]);
-    let unidad = match[2];
 
-    // Convertir todo a una unidad base para comparar con exactitud (ml o g)
-    if (['l', 'lt', 'lts', 'litro', 'litros'].includes(unidad)) {
-        valor = Math.round(valor * 1000);
-        unidad = 'ml';
-    } else if (unidad === 'cc') {
-        unidad = 'ml';
-    } else if (['kg', 'kilo', 'kilos'].includes(unidad)) {
-        valor = Math.round(valor * 1000);
-        unidad = 'g';
-    } else if (['gr', 'grs', 'gramos'].includes(unidad)) {
-        unidad = 'g';
-    } else if (['und', 'unidades'].includes(unidad)) {
-        unidad = 'un';
+    let pesoVolumen = null;
+    let unidadesPack = null;
+
+    // A. Detectar patrón "6 x 200 g" o "6x200ml"
+    const matchMulti = limpio.match(/\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos)\b/);
+    if (matchMulti) {
+        unidadesPack = parseInt(matchMulti[1], 10);
     }
-    return `${valor}${unidad}`;
+
+    // B. Detectar patrón "6 un", "6 unidades", "pack 6"
+    if (!unidadesPack) {
+        const matchUn = limpio.match(/\b(\d+)\s*(un|und|unidades|unidad)\b/) || limpio.match(/\bpack\s*(?:de\s*)?(\d+)\b/);
+        if (matchUn) {
+            unidadesPack = parseInt(matchUn[1], 10);
+        }
+    }
+
+    // C. Extraer peso o volumen real (g, kg, ml, l) ignorando las unidades ("un")
+    const matchPeso = limpio.match(/\b(\d+(?:\.\d+)?)\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos)\b/);
+    if (matchPeso) {
+        let valor = parseFloat(matchPeso[1]);
+        let unidad = matchPeso[2];
+
+        if (['l', 'lt', 'lts', 'litro', 'litros'].includes(unidad)) {
+            valor = Math.round(valor * 1000);
+            unidad = 'ml';
+        } else if (unidad === 'cc') {
+            unidad = 'ml';
+        } else if (['kg', 'kilo', 'kilos'].includes(unidad)) {
+            valor = Math.round(valor * 1000);
+            unidad = 'g';
+        } else if (['gr', 'grs', 'gramos'].includes(unidad)) {
+            unidad = 'g';
+        }
+        pesoVolumen = `${valor}${unidad}`;
+    }
+
+    return { pesoVolumen, unidadesPack };
 }
 
-// 3. Convierte el nombre en una lista de palabras clave limpias (sin conectores ni medidas)
+// 3. Convierte el nombre en una lista de palabras clave limpias (normalizando plurales simples y quitando ruido)
 function obtenerTokensClave(nombre, marca = '') {
     const stopWords = new Set([
         'de', 'el', 'la', 'los', 'las', 'en', 'con', 'para', 'por', 'sin', 'del', 'al', 'un', 'una',
         'gl', 'grados', 'grado', 'botella', 'envase', 'bolsa', 'caja', 'pack', 'display', 'formato',
-        'unidades', 'unidad', 'un', 'und', 'tottus', 'marca'
+        'unidades', 'unidad', 'und', 'tottus', 'marca', 'x',
+        // Marcas paraguas / fabricantes que unos supers agregan al título y otros omiten
+        'carozzi', 'nestle', 'ccu', 'watts', 'soprole', 'agrosuper', 'unilever', 'tresmontes', 'iansa'
     ]);
 
     const textoCompleto = `${nombre} ${marca}`
         .toLowerCase()
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
+        // Separar "6x200g" antes de limpiar medidas
+        .replace(/\b(\d+)\s*x\s*(\d+)/g, '$1 $2')
         .replace(/(\d+)\s*[°º]?\s*(gl|grados|grado)\b/g, '$1')
         .replace(/[°º]/g, ' ')
-        // Quitamos las medidas de los tokens porque ya las validamos con extraerMedida()
-        .replace(/\b\d+(?:[.,]\d+)?\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos|un|und|unidades)\b/g, ' ')
+        // Quitamos las medidas y cantidades de pack porque ya se validan en extraerInfoMedidas()
+        .replace(/\b\d+(?:[.,]\d+)?\s*(ml|cc|l|lt|lts|litro|litros|g|gr|grs|gramos|kg|kilo|kilos|un|und|unidades|unidad)\b/g, ' ')
         .replace(/[^a-z0-9\s]/g, ' ');
 
-    return [...new Set(
-        textoCompleto
-            .split(/\s+/)
-            .filter(w => w.length >= 2 && !stopWords.has(w))
-    )];
+    const tokens = textoCompleto
+        .split(/\s+/)
+        .map(w => {
+            // Normalizar plurales comunes ("tomates" -> "tomate")
+            if (w.length > 4 && w.endsWith('es') && !w.endsWith('tes')) return w.slice(0, -2);
+            if (w.length > 4 && w.endsWith('s')) return w.slice(0, -1);
+            return w;
+        })
+        .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !stopWords.has(w));
+
+    return [...new Set(tokens)];
 }
 
 // 4. Buscador por similitud inteligente cuando falla el cruce exacto
@@ -98,19 +126,26 @@ function buscarProductoPorSimilitud(prodTottus, listaCatalogoProcesado) {
     const tokensTottus = obtenerTokensClave(prodTottus.nombre, prodTottus.marca);
     if (tokensTottus.length === 0) return null;
 
-    const medidaTottus = extraerMedida(prodTottus.nombre);
+    const infoTottus = extraerInfoMedidas(prodTottus.nombre);
     const marcaTottus = normalizarTextoCruce(prodTottus.marca);
 
     let mejorId = null;
     let mejorPuntaje = 0;
 
     for (const itemBD of listaCatalogoProcesado) {
-        // Regla A: Si AMBOS productos tienen medida explícita (ej: 1L vs 750ml) y son distintas, descartar de inmediato
-        if (medidaTottus && itemBD.medida && medidaTottus !== itemBD.medida) {
+        // Regla A: Si AMBOS especifican peso/volumen (ej: 200g vs 400g) y son distintos, descartar
+        if (infoTottus.pesoVolumen && itemBD.infoMedidas.pesoVolumen && infoTottus.pesoVolumen !== itemBD.infoMedidas.pesoVolumen) {
             continue;
         }
 
-        // Regla B: Contar cuántas palabras clave comparten (ej: ['whisky', 'white', 'horse', '40'])
+        // Regla B: Si uno es un multipack (>1 unidad) y el otro tiene una cantidad de pack distinta (o es individual), descartar
+        const packT = infoTottus.unidadesPack || 1;
+        const packBD = itemBD.infoMedidas.unidadesPack || 1;
+        if (packT !== packBD && (packT > 1 || packBD > 1)) {
+            continue;
+        }
+
+        // Regla C: Contar palabras clave en común
         let coincidencias = 0;
         for (const t of tokensTottus) {
             if (itemBD.tokens.includes(t)) {
@@ -120,28 +155,34 @@ function buscarProductoPorSimilitud(prodTottus, listaCatalogoProcesado) {
 
         if (coincidencias === 0) continue;
 
-        // Calculamos porcentaje de similitud sobre el producto que tenga menos palabras descriptivas
         const minTokens = Math.min(tokensTottus.length, itemBD.tokens.length);
         const maxTokens = Math.max(tokensTottus.length, itemBD.tokens.length);
         
         let puntaje = coincidencias / minTokens;
-
-        // Penalizar levemente si uno tiene muchas más palabras que el otro
         const ratioLongitud = minTokens / maxTokens;
         puntaje = (puntaje * 0.75) + (ratioLongitud * 0.25);
 
-        // Bonus si la marca coincide o está contenida
-        if (marcaTottus && itemBD.marcaNorm && (marcaTottus === itemBD.marcaNorm || itemBD.nombreNorm.includes(marcaTottus))) {
-            puntaje += 0.1;
+        // Bonus si la marca coincide o está contenida en el nombre/marca de la BD
+        const marcaCoincide = marcaTottus && itemBD.marcaNorm && (
+            marcaTottus === itemBD.marcaNorm ||
+            itemBD.nombreNorm.includes(marcaTottus) ||
+            marcaTottus.includes(itemBD.marcaNorm)
+        );
+        if (marcaCoincide) {
+            puntaje += 0.12;
         }
 
-        // Bonus si ambos tienen exactamente la misma medida (ej: ambos dicen 1000ml)
-        if (medidaTottus && itemBD.medida && medidaTottus === itemBD.medida) {
-            puntaje += 0.1;
+        // Bonus si tienen exactamente el mismo gramaje/volumen (ej: ambos 200g)
+        if (infoTottus.pesoVolumen && itemBD.infoMedidas.pesoVolumen === infoTottus.pesoVolumen) {
+            puntaje += 0.12;
         }
 
-        // Exigimos al menos 2 palabras clave en común y un puntaje >= 0.80 para asegurar que sea el mismo producto
-        if (coincidencias >= 2 && puntaje >= 0.80 && puntaje > mejorPuntaje) {
+        // Bonus extra si además coinciden en cantidad de pack (ej: ambos son pack de 6)
+        if (packT > 1 && packT === packBD) {
+            puntaje += 0.10;
+        }
+
+        if (coincidencias >= 2 && puntaje >= 0.78 && puntaje > mejorPuntaje) {
             mejorPuntaje = puntaje;
             mejorId = itemBD.id;
         }
@@ -197,7 +238,7 @@ async function explorarTottus() {
                 nombreOriginal: item.nombre,
                 nombreNorm: claveSoloNombre,
                 marcaNorm: normalizarTextoCruce(item.marca || ''),
-                medida: extraerMedida(item.nombre),
+                infoMedidas: extraerInfoMedidas(item.nombre),
                 tokens: obtenerTokensClave(item.nombre, item.marca || '')
             });
         }
@@ -236,20 +277,22 @@ async function explorarTottus() {
             Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
         });
 
-        // Captura respuestas JSON internas de la red
+        // Captura respuestas JSON internas de la red (incluyendo llamadas AJAX al paginar)
         let productosCapturadosRed = [];
         page.on('response', async (response) => {
             try {
                 const url = response.url();
                 const contentType = response.headers()['content-type'] || '';
-                if (contentType.includes('application/json') && (url.includes('tottus') || url.includes('search') || url.includes('category') || url.includes('pageProps'))) {
+                if (contentType.includes('application/json') && (url.includes('tottus') || url.includes('search') || url.includes('category') || url.includes('pageProps') || url.includes('api'))) {
                     const data = await response.json();
                     const posiblesListas = [
                         data?.results,
                         data?.data?.results,
                         data?.pageProps?.results,
                         data?.pageProps?.data?.results,
-                        data?.props?.pageProps?.results
+                        data?.props?.pageProps?.results,
+                        data?.data?.products,
+                        data?.products
                     ];
                     for (const lista of posiblesListas) {
                         if (Array.isArray(lista) && lista.length > 0) {
@@ -285,118 +328,207 @@ async function explorarTottus() {
             console.log(`\n======================================================`);
             console.log(`🚀 INICIANDO CATEGORÍA TOTTUS: ${urlCategoria}`);
             
+            let paginasVaciasConsecutivas = 0;
+
             for (let numPagina = 1; numPagina <= 50; numPagina++) {
                 productosCapturadosRed = [];
                 const separador = urlCategoria.includes('?') ? '&' : '?';
                 const urlActual = `${urlCategoria}${separador}page=${numPagina}`;
                 console.log(`➡️ PÁGINA ${numPagina}: ${urlActual}`);
-                
-                try {
-                    await page.goto(urlActual, { waitUntil: 'networkidle0', timeout: 60000 });
-                } catch (err) {
-                    console.log('⚠️ Timeout de red controlado, continuando...');
-                }
 
-                console.log('Esperando resolución de seguridad de Tottus...');
-                await new Promise(resolve => setTimeout(resolve, 8000));
+                let productosExtraidos = [];
 
-                let tituloPagina = await page.title();
-                console.log(`📄 Título en Tottus: "${tituloPagina}"`);
-
-                if (tituloPagina.includes('Un momento') || tituloPagina.includes('Just a moment')) {
-                    console.log('🛡️ Escudo Cloudflare detectado, simulando movimiento de mouse...');
-                    await page.mouse.move(120, 250);
-                    await page.mouse.down();
-                    await page.mouse.up();
-                    await new Promise(resolve => setTimeout(resolve, 6000));
-                }
-
-                console.log('Bajando por la página para cargar todas las imágenes (Lazy Load)...');
-                await page.evaluate(async () => {
-                    await new Promise((resolve) => {
-                        let totalHeight = 0;
-                        let distance = 300;
-                        let steps = 0;
-                        let timer = setInterval(() => {
-                            let scrollHeight = document.body ? document.body.scrollHeight : 0;
-                            window.scrollBy(0, distance);
-                            totalHeight += distance;
-                            steps++;
-                            if (totalHeight >= scrollHeight - window.innerHeight || steps > 35) {
-                                clearInterval(timer);
-                                resolve();
-                            }
-                        }, 120);
-                    });
-                });
-                await new Promise(resolve => setTimeout(resolve, 2500));
-
-                // Extracción limpia basada exclusivamente en __NEXT_DATA__
-                const productosDOM = await page.evaluate(() => {
-                    const resultados = [];
-                    const urlsVistas = new Set();
-
-                    function buscarArraysProductos(obj) {
-                        if (!obj || typeof obj !== 'object') return;
-                        if (Array.isArray(obj)) {
-                            for (const el of obj) {
-                                if (el && typeof el === 'object' && (el.displayName || el.productId) && Array.isArray(el.prices)) {
-                                    const nombre = (el.displayName || el.name || '').trim();
-                                    const marca = (el.brand || 'Sin marca').trim();
-                                    const url_producto = el.url || (el.productId ? `https://www.tottus.cl/tottus-cl/articulo/${el.productId}/${encodeURIComponent(nombre)}` : '');
-                                    const url_imagen = Array.isArray(el.mediaUrls) && el.mediaUrls.length > 0 ? el.mediaUrls[0] : null;
-
-                                    let precio = 0;
-                                    for (const p of el.prices) {
-                                        const valStr = Array.isArray(p.price) ? p.price[0] : p.price;
-                                        if (valStr) {
-                                            const limpio = parseInt(valStr.toString().replace(/\./g, '').replace(/[^0-9]/g, ''), 10);
-                                            if (limpio > 0 && (precio === 0 || limpio < precio)) precio = limpio;
-                                        }
-                                    }
-                                    if (nombre && precio > 0 && !urlsVistas.has(nombre.toLowerCase())) {
-                                        urlsVistas.add(nombre.toLowerCase());
-                                        resultados.push({ nombre, marca, precio, url_producto, url_imagen });
-                                    }
-                                } else {
-                                    buscarArraysProductos(el);
+                // Hasta 3 intentos por página si Tottus redirige al Home o demora en cargar
+                for (let intento = 1; intento <= 3; intento++) {
+                    try {
+                        let navegoPorClick = false;
+                        if (numPagina > 1 && intento === 1) {
+                            navegoPorClick = await page.evaluate((targetPage) => {
+                                const botones = Array.from(document.querySelectorAll('button, a, li'));
+                                const btnNumero = botones.find(b => b.textContent && b.textContent.trim() === String(targetPage));
+                                if (btnNumero) {
+                                    btnNumero.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                    btnNumero.click();
+                                    return true;
                                 }
+                                const btnSiguiente = document.querySelector(
+                                    'button[id*="next"], a[id*="next"], button[aria-label*="Siguiente"], button[aria-label*="next"], [class*="pagination"] button:last-child'
+                                );
+                                if (btnSiguiente && !btnSiguiente.disabled) {
+                                    btnSiguiente.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                    btnSiguiente.click();
+                                    return true;
+                                }
+                                return false;
+                            }, numPagina);
+
+                            if (navegoPorClick) {
+                                console.log(`🖱️ Paginación SPA activada hacia página ${numPagina}...`);
+                                await new Promise(resolve => setTimeout(resolve, 6000));
                             }
-                            return;
                         }
-                        for (const k of Object.keys(obj)) {
-                            buscarArraysProductos(obj[k]);
+
+                        if (!navegoPorClick) {
+                            await page.goto(urlActual, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                            await new Promise(resolve => setTimeout(resolve, 7000));
                         }
+                    } catch (err) {
+                        console.log(`⚠️ Timeout controlado en intento ${intento}, continuando...`);
+                    }
+
+                    let tituloPagina = await page.title();
+                    console.log(`📄 Título en Tottus (Intento ${intento}): "${tituloPagina}"`);
+
+                    if (tituloPagina.includes('Un momento') || tituloPagina.includes('Just a moment')) {
+                        console.log('🛡️ Escudo Cloudflare detectado, simulando movimiento de mouse...');
+                        await page.mouse.move(120 + intento * 20, 250);
+                        await page.mouse.down();
+                        await page.mouse.up();
+                        await new Promise(resolve => setTimeout(resolve, 7000));
+                        tituloPagina = await page.title();
                     }
 
                     try {
-                        const nextScript = document.getElementById('__NEXT_DATA__');
-                        if (nextScript) {
-                            const nextJson = JSON.parse(nextScript.textContent);
-                            buscarArraysProductos(nextJson);
+                        await page.waitForSelector('a[href*="/articulo/"], [data-pod], [class*="pod"]', { timeout: 10000 });
+                    } catch (_) {}
+
+                    console.log('Bajando por la página para cargar todas las imágenes (Lazy Load)...');
+                    await page.evaluate(async () => {
+                        await new Promise((resolve) => {
+                            let totalHeight = 0;
+                            let distance = 350;
+                            let steps = 0;
+                            let timer = setInterval(() => {
+                                let scrollHeight = document.body ? document.body.scrollHeight : 0;
+                                window.scrollBy(0, distance);
+                                totalHeight += distance;
+                                steps++;
+                                if (totalHeight >= scrollHeight - window.innerHeight || steps > 35) {
+                                    clearInterval(timer);
+                                    resolve();
+                                }
+                            }, 130);
+                        });
+                    });
+                    await new Promise(resolve => setTimeout(resolve, 2500));
+
+                    const productosDOM = await page.evaluate((numPagActual) => {
+                        const resultados = [];
+                        const nombresVistos = new Set();
+
+                        // A. Extraer desde Tarjetas HTML visibles en pantalla
+                        const cards = document.querySelectorAll('[data-pod], [class*="pod-"], li[class*="product"], div[class*="search-results"] a[href*="/articulo/"]');
+                        cards.forEach(card => {
+                            const contenedor = card.closest('[data-pod], li, div[class*="pod"]') || card;
+                            const linkEl = contenedor.querySelector('a[href*="/articulo/"]') || (contenedor.tagName === 'A' ? contenedor : null);
+                            if (!linkEl) return;
+
+                            const nombreEl = contenedor.querySelector('b[class*="subTitle"], [class*="subTitle"], [class*="display-name"], h2, h3');
+                            const marcaEl = contenedor.querySelector('b[class*="title"], [class*="brand"], [class*="title-rebrand"]');
+                            const imgEl = contenedor.querySelector('img');
+
+                            const nombre = (nombreEl ? nombreEl.textContent : linkEl.textContent || '').trim();
+                            const marca = (marcaEl ? marcaEl.textContent : 'Sin marca').trim();
+                            const url_producto = linkEl.href || '';
+                            const url_imagen = imgEl ? (imgEl.currentSrc || imgEl.src || imgEl.getAttribute('data-src')) : null;
+
+                            let precio = 0;
+                            const textosPrecio = contenedor.querySelectorAll('[data-internet-price], [data-cmr-price], [class*="price"], span');
+                            textosPrecio.forEach(el => {
+                                const txt = (el.getAttribute('data-internet-price') || el.textContent || '').trim();
+                                if (txt.includes('$') || /^\d{1,3}(\.\d{3})+$/.test(txt)) {
+                                    const limpio = parseInt(txt.replace(/\./g, '').replace(/[^0-9]/g, ''), 10);
+                                    if (limpio >= 100 && limpio < 5000000 && (precio === 0 || limpio < precio)) {
+                                        precio = limpio;
+                                    }
+                                }
+                            });
+
+                            if (nombre && nombre.length > 3 && !nombre.toLowerCase().includes('word word') && precio > 0 && !nombresVistos.has(nombre.toLowerCase())) {
+                                nombresVistos.add(nombre.toLowerCase());
+                                resultados.push({ nombre, marca, precio, url_producto, url_imagen });
+                            }
+                        });
+
+                        // B. Respaldar con __NEXT_DATA__
+                        if (resultados.length === 0 || numPagActual === 1) {
+                            function buscarArraysProductos(obj) {
+                                if (!obj || typeof obj !== 'object') return;
+                                if (Array.isArray(obj)) {
+                                    for (const el of obj) {
+                                        if (el && typeof el === 'object' && (el.displayName || el.productId) && Array.isArray(el.prices)) {
+                                            const nombre = (el.displayName || el.name || '').trim();
+                                            const marca = (el.brand || 'Sin marca').trim();
+                                            const url_producto = el.url || (el.productId ? `https://www.tottus.cl/tottus-cl/articulo/${el.productId}/${encodeURIComponent(nombre)}` : '');
+                                            const url_imagen = Array.isArray(el.mediaUrls) && el.mediaUrls.length > 0 ? el.mediaUrls[0] : null;
+
+                                            let precio = 0;
+                                            for (const p of el.prices) {
+                                                const valStr = Array.isArray(p.price) ? p.price[0] : p.price;
+                                                if (valStr) {
+                                                    const limpio = parseInt(valStr.toString().replace(/\./g, '').replace(/[^0-9]/g, ''), 10);
+                                                    if (limpio > 0 && (precio === 0 || limpio < precio)) precio = limpio;
+                                                }
+                                            }
+                                            if (nombre && precio > 0 && !nombresVistos.has(nombre.toLowerCase())) {
+                                                nombresVistos.add(nombre.toLowerCase());
+                                                resultados.push({ nombre, marca, precio, url_producto, url_imagen });
+                                            }
+                                        } else {
+                                            buscarArraysProductos(el);
+                                        }
+                                    }
+                                    return;
+                                }
+                                for (const k of Object.keys(obj)) {
+                                    buscarArraysProductos(obj[k]);
+                                }
+                            }
+
+                            try {
+                                const nextScript = document.getElementById('__NEXT_DATA__');
+                                if (nextScript) {
+                                    const nextJson = JSON.parse(nextScript.textContent);
+                                    buscarArraysProductos(nextJson);
+                                }
+                            } catch (e) {}
                         }
-                    } catch (e) {}
 
-                    return resultados;
-                });
+                        return resultados;
+                    }, numPagina);
 
-                const mapaUnicosPagina = new Map();
-                [...productosDOM, ...productosCapturadosRed].forEach(p => {
-                    const key = p.nombre.toLowerCase();
-                    if (!mapaUnicosPagina.has(key)) {
-                        mapaUnicosPagina.set(key, p);
+                    const mapaUnicosPagina = new Map();
+                    [...productosCapturadosRed, ...productosDOM].forEach(p => {
+                        const key = p.nombre.toLowerCase();
+                        if (!mapaUnicosPagina.has(key)) {
+                            mapaUnicosPagina.set(key, p);
+                        }
+                    });
+                    productosExtraidos = Array.from(mapaUnicosPagina.values());
+
+                    if (productosExtraidos.length > 0) {
+                        break;
                     }
-                });
-                const productosExtraidos = Array.from(mapaUnicosPagina.values());
+
+                    console.log(`🔄 0 productos en intento ${intento}/3 de página ${numPagina}. Esperando 5s antes de reintentar...`);
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
 
                 console.log(`¡Se extrajeron ${productosExtraidos.length} productos limpios de esta página!`);
 
                 if (productosExtraidos.length === 0) {
-                    console.log('⚠️ No se detectaron más productos en esta categoría. Pasando a la siguiente...');
-                    break;
+                    paginasVaciasConsecutivas++;
+                    console.log(`⚠️ Página ${numPagina} sin productos (${paginasVaciasConsecutivas}/2 vacías consecutivas).`);
+                    if (paginasVaciasConsecutivas >= 2) {
+                        console.log('🏁 Fin confirmado de la categoría. Pasando a la siguiente...');
+                        break;
+                    }
+                    continue;
                 }
 
-                console.log('Cruzando con la base de datos (Exacto + Similitud Inteligente)...');
+                paginasVaciasConsecutivas = 0;
+
+                console.log('Cruzando con la base de datos (Exacto + Similitud Inteligente + Multipacks)...');
                 let actualizadosPagina = 0;
                 let omitidosPagina = 0;
 
@@ -420,7 +552,6 @@ async function explorarTottus() {
 
                         productoId = mapaCatalogo.get(clave1) || mapaCatalogo.get(clave2) || mapaCatalogo.get(clave3) || null;
 
-                        // Si no cruzó exacto, usamos el cruce inteligente por similitud de palabras y medidas
                         if (!productoId) {
                             productoId = buscarProductoPorSimilitud(prod, catalogoProcesado);
                         }
@@ -493,7 +624,7 @@ async function explorarTottus() {
                 }
 
                 console.log(`✅ Página ${numPagina} lista: 🔗 ${actualizadosPagina} precios actualizados | 🚫 ${omitidosPagina} ignorados.`);
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                await new Promise(resolve => setTimeout(resolve, 3500));
             }
         }
 
