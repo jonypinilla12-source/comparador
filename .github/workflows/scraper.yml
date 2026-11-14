@@ -9,7 +9,22 @@ on:
 jobs:
   ejecutar-scrapers:
     runs-on: ubuntu-latest
+    # Cada supermercado tiene sus propios 350 minutos independientes
     timeout-minutes: 350
+    strategy:
+      fail-fast: false # Si uno falla o demora, los otros 4 siguen corriendo normal
+      matrix:
+        scraper:
+          - nombre: Tottus
+            archivo: scraperTottus.js
+          - nombre: Lider
+            archivo: scraperLider.js
+          - nombre: Jumbo
+            archivo: scraperJumbo.js
+          - nombre: Santa Isabel
+            archivo: scraperSantaIsabel.js
+          - nombre: Unimarc
+            archivo: scraperUnimarc.js
 
     env:
       TZ: America/Santiago
@@ -29,15 +44,13 @@ jobs:
 
       - name: Instalar dependencias limpias y navegador Chrome
         run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
           rm -rf node_modules
           npm install
           npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth
           npx puppeteer browsers install chrome
 
-      - name: Ejecutar Scraper Lider (Con Monitor Virtual Xvfb)
+      - name: Ejecutar Scraper ${{ matrix.scraper.nombre }}
         continue-on-error: true
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperLider.js
-
-      - name: Ejecutar Scraper Jumbo
-        continue-on-error: true
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node scraperJumbo.js
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node ${{ matrix.scraper.archivo }}
